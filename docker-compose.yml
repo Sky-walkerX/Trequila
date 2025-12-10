@@ -1,0 +1,12 @@
+version: "3.8"
+services:
+  nats:
+    image: nats:latest
+    ports:
+      - "4222:4222"   # client
+      - "8222:8222"   # monitoring
+    command:
+      - "-js"
+      - "-m"
+      - "8222"
+      - "--trace"
