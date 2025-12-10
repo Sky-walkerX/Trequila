@@ -42,7 +42,7 @@ func DefaultConfig(apiKey string) Config {
 	return Config{
 		APIKey:          apiKey,
 		Model:           "gemini-2.5-flash",
-		MaxOutputTokens: 8192,
+		MaxOutputTokens: 16384,
 		Temperature:     0.7,
 		TopP:            0.95,
 		TimeoutSeconds:  60,

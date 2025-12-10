@@ -13,8 +13,27 @@ services:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/varz"]
       interval: 2s
       timeout: 2s
-      retries: 5
+      retries: 20
       start_period: 5s
+
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=trequila
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Maps your local init.sql to run automatically on startup
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   api:
     build:
@@ -24,8 +43,11 @@ services:
       - "8080:8080"
     environment:
       - NATS_URL=nats://nats:4222
+      - DB_URL=postgres://postgres:password@db:5432/trequila?sslmode=disable
     depends_on:
       nats:
+        condition: service_healthy
+      db:
         condition: service_healthy
 
   planner:
@@ -38,3 +60,6 @@ services:
     depends_on:
       nats:
         condition: service_healthy
+
+volumes:
+  postgres_data:

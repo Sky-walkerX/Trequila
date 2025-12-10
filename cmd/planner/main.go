@@ -1,3 +1,4 @@
+// cmd/planner/main.go
 // Planner service - consumes trip requests and generates AI-powered itineraries
 package main
 

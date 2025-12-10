@@ -1,3 +1,4 @@
+// internal/planner/planner.go
 // Package planner provides the trip planning service that orchestrates itinerary generation
 package planner
 
@@ -46,16 +47,16 @@ type Config struct {
 // DefaultConfig returns a sensible default configuration
 func DefaultConfig() Config {
     return Config{
-        // Change the name to break the current "lock" immediately
-        ConsumerName:  "planner-durable-v2", 
+        // 1. Bump the version to force a fresh consumer state
+        ConsumerName: "planner-durable-v3", 
 
         InputSubject:  "trips.requested",
         OutputSubject: "trips.itinerary",
-        
-        // Change this from 120s to 10s for development!
-        // If the planner crashes, NATS will retry in 10 seconds, not 2 minutes.
-        AckWait:       10 * time.Second, 
-        
+
+        // 2. CRITICAL FIX: Increase this from 10s to 2 minutes
+        // This gives Gemini enough time to finish before NATS gets impatient.
+        AckWait: 2 * time.Minute, 
+
         MaxDeliver:    3,
         MaxAckPending: 100,
     }
@@ -197,9 +198,10 @@ func (s *Service) publishItinerary(ctx context.Context, trip types.TripRequest, 
 	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	_, err = s.js.Publish(pubCtx, s.config.OutputSubject, data,
-		jetstream.WithMsgID(trip.RequestID),
-	)
+	// Note: We don't use WithMsgID for results because:
+	// 1. Deduplication can prevent redelivery if the consumer missed the first message
+	// 2. The database update is idempotent anyway (same data overwrites same data)
+	_, err = s.js.Publish(pubCtx, s.config.OutputSubject, data)
 	if err != nil {
 		return fmt.Errorf("failed to publish: %w", err)
 	}
