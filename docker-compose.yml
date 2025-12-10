@@ -1,7 +1,6 @@
-version: "3.8"
 services:
   nats:
-    image: nats:latest
+    image: nats:alpine
     ports:
       - "4222:4222"   # client
       - "8222:8222"   # monitoring
@@ -10,3 +9,32 @@ services:
       - "-m"
       - "8222"
       - "--trace"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/varz"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8080:8080"
+    environment:
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  planner:
+    build:
+      context: .
+      dockerfile: Dockerfile.planner
+    environment:
+      - NATS_URL=nats://nats:4222
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    depends_on:
+      nats:
+        condition: service_healthy

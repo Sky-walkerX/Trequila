@@ -1,3 +1,4 @@
+// API Gateway - accepts trip requests and publishes them to NATS
 package main
 
 import (
@@ -6,15 +7,18 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	natshelper "github.com/sky-walkerx/trequila/internal/nats"
+	"github.com/sky-walkerx/trequila/internal/types"
 )
 
-type TripRequest struct {
+// APITripRequest represents the incoming HTTP request body
+type APITripRequest struct {
 	UserID      string   `json:"user_id"`
 	Source      string   `json:"source"`
 	Destination string   `json:"destination"`
@@ -26,19 +30,23 @@ type TripRequest struct {
 }
 
 func main() {
+	// Get NATS URL from environment or use default
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		natsURL = nats.DefaultURL
+	}
+
 	// Initialize JetStream connection
-	js := natshelper.ConnectJetStream(nats.DefaultURL)
+	js := natshelper.ConnectJetStream(natsURL)
 
 	// Define HTTP handler for trip requests
 	http.HandleFunc("/trips", func(w http.ResponseWriter, r *http.Request) {
-		// Only accept POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Parse incoming JSON request
-		var req TripRequest
+		var req APITripRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -51,7 +59,7 @@ func main() {
 			return
 		}
 
-		// Validate date format and calculate days if not provided
+		// Validate date format
 		startDate, err := time.Parse("2006-01-02", req.StartDate)
 		if err != nil {
 			http.Error(w, "invalid start_date format (expected YYYY-MM-DD)", http.StatusBadRequest)
@@ -64,7 +72,6 @@ func main() {
 			return
 		}
 
-		// Validate end date is after start date
 		if endDate.Before(startDate) || endDate.Equal(startDate) {
 			http.Error(w, "end_date must be after start_date", http.StatusBadRequest)
 			return
@@ -75,36 +82,34 @@ func main() {
 			req.Days = int(endDate.Sub(startDate).Hours() / 24)
 		}
 
-		// Generate unique ID for this request
+		// Generate unique request ID
 		requestID := uuid.NewString()
 
-		// Create event payload following event-driven pattern
-		ev := map[string]interface{}{
-			"type": "TripRequested", // Event type
-			"data": map[string]interface{}{
-				"request_id":  requestID,
-				"user_id":     req.UserID,
-				"source":      req.Source,
-				"destination": req.Destination,
-				"start_date":  req.StartDate,
-				"end_date":    req.EndDate,
-				"days":        req.Days,
-				"budget":      req.Budget,
-				"interests":   req.Interests,
-				"created_at":  time.Now().UTC().Format(time.RFC3339),
+		// Create typed event using shared types
+		event := types.TripEvent{
+			Type: "TripRequested",
+			Data: types.TripRequest{
+				RequestID:   requestID,
+				UserID:      req.UserID,
+				Source:      req.Source,
+				Destination: req.Destination,
+				StartDate:   req.StartDate,
+				EndDate:     req.EndDate,
+				Days:        req.Days,
+				Budget:      req.Budget,
+				Interests:   req.Interests,
+				CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 			},
 		}
 
-		b, _ := json.Marshal(ev)
+		data, _ := json.Marshal(event)
 
-		// Publish to JetStream with timeout
+		// Publish to JetStream
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 
-		// Publish message to "trips.requested" subject
-		// WithMsgID ensures message deduplication within the configured window
-		ack, err := js.Publish(ctx, "trips.requested", b,
-			jetstream.WithMsgID(requestID), // Prevents duplicate processing
+		ack, err := js.Publish(ctx, "trips.requested", data,
+			jetstream.WithMsgID(requestID),
 		)
 		if err != nil {
 			http.Error(w, "publish failed", http.StatusInternalServerError)
@@ -114,7 +119,6 @@ func main() {
 
 		log.Printf("Published TripRequested event: %s (seq: %d)", requestID, ack.Sequence)
 
-		// Return success response with request ID
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w,
 			`{"request_id":"%s","seq":%d,"status":"processing"}`,
