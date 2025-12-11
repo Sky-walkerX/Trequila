@@ -1,4 +1,3 @@
-// cmd/api/main.go
 package main
 
 import (
@@ -68,9 +67,15 @@ func main() {
 		db: db,
 	}
 
-	// 3. Start Background Consumer
-	// This listens for completed itineraries and saves them to Postgres
+	// 3. Start Background Consumers
+	// A. Listens for completed itineraries
 	go server.consumeItineraries()
+
+	// B. Listens for found images
+	go server.consumeImages()
+
+	// C. Listens for found places (NEW)
+	go server.consumePlaces()
 
 	// 4. Setup Routes
 	http.HandleFunc("/trips", server.handleCreateTrip) // POST: Create request
@@ -137,8 +142,8 @@ func (s *Server) handleCreateTrip(w http.ResponseWriter, r *http.Request) {
 
 	// A. Insert into Database (Status: Pending)
 	_, err = s.db.Exec(`
-		INSERT INTO trips (request_id, user_id, source, destination, start_date, end_date, budget, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
+        INSERT INTO trips (request_id, user_id, source, destination, start_date, end_date, budget, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
 		requestID, req.UserID, req.Source, req.Destination, req.StartDate, req.EndDate, req.Budget,
 	)
 	if err != nil {
@@ -199,13 +204,15 @@ func (s *Server) handleGetTrip(w http.ResponseWriter, r *http.Request) {
 
 	var status string
 	var itineraryJSON []byte
+	var imagesJSON []byte
+	var placesJSON []byte
 	var generatedAt sql.NullString
 
-	// Retrieve from DB
+	// Retrieve from DB (Added 'images' and 'places' columns)
 	err := s.db.QueryRow(`
-		SELECT status, itinerary, updated_at 
-		FROM trips WHERE request_id = $1`, id,
-	).Scan(&status, &itineraryJSON, &generatedAt)
+        SELECT status, itinerary, images, places, updated_at 
+        FROM trips WHERE request_id = $1`, id,
+	).Scan(&status, &itineraryJSON, &imagesJSON, &placesJSON, &generatedAt)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "trip not found", http.StatusNotFound)
@@ -222,9 +229,21 @@ func (s *Server) handleGetTrip(w http.ResponseWriter, r *http.Request) {
 	resp["status"] = status
 
 	if len(itineraryJSON) > 0 {
-		resp["itinerary"] = json.RawMessage(itineraryJSON) // Embeds raw JSON without double-escaping
+		resp["itinerary"] = json.RawMessage(itineraryJSON)
 	} else {
 		resp["itinerary"] = nil
+	}
+
+	if len(imagesJSON) > 0 {
+		resp["images"] = json.RawMessage(imagesJSON)
+	} else {
+		resp["images"] = nil
+	}
+
+	if len(placesJSON) > 0 {
+		resp["places"] = json.RawMessage(placesJSON)
+	} else {
+		resp["places"] = nil
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -236,63 +255,188 @@ func (s *Server) consumeItineraries() {
 	ctx := context.Background()
 	var cons jetstream.Consumer
 
-	// 1. Retry Loop: Wait for the TRIPS stream to be created by the Planner
-	// If API starts first, this loop prevents it from crashing.
 	for {
 		stream, err := s.js.Stream(ctx, "TRIPS")
 		if err == nil {
 			cons, err = stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-				Durable:       "api-result-writer-v4", // Bumped version to reset consumer state
+				Durable:       "api-result-writer-v5",
 				FilterSubject: "trips.itinerary",
 				AckPolicy:     jetstream.AckExplicitPolicy,
-				DeliverPolicy: jetstream.DeliverAllPolicy, // Deliver ALL messages, including old ones
-				AckWait:       30 * time.Second,           // How long to wait for ack before redelivery
-				MaxDeliver:    5,                          // Max redelivery attempts
+				DeliverPolicy: jetstream.DeliverAllPolicy,
+				AckWait:       30 * time.Second,
+				MaxDeliver:    5,
 			})
 			if err == nil {
-				break // Successfully connected!
+				break
 			}
 		}
-		log.Printf("Waiting for TRIPS stream... (%v)", err)
+		log.Printf("Waiting for TRIPS stream (itinerary)... (%v)", err)
 		time.Sleep(3 * time.Second)
 	}
 
 	log.Println("Background Consumer: Listening for Generated Itineraries...")
 
-	// 2. Processing Loop
 	for {
-		// Fetch 1 message, waiting up to 5 seconds
 		msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
 		if err != nil {
-			// Normal timeout (no messages) or connection issue; just retry
 			continue
 		}
 
-		// SAFER LOOP: Use 'range' to handle the batch.
-		// This prevents the nil-pointer panic if the batch is empty.
 		for msg := range msgs.Messages() {
 			var event types.ItineraryGeneratedEvent
 			if err := json.Unmarshal(msg.Data(), &event); err != nil {
 				log.Printf("Invalid event format: %v", err)
-				msg.Ack() // Ack bad data to remove it
+				msg.Ack()
 				continue
 			}
 
-			// Update Database
 			itineraryBytes, _ := json.Marshal(event.Data.Itinerary)
 
+			// Cast to string for correct Postgres JSON/JSONB handling
 			_, err = s.db.Exec(`
-				UPDATE trips 
-				SET status = 'completed', itinerary = $1, updated_at = NOW()
-				WHERE request_id = $2`,
-				itineraryBytes, event.Data.RequestID,
+                UPDATE trips 
+                SET status = 'completed', itinerary = $1, updated_at = NOW()
+                WHERE request_id = $2`,
+				string(itineraryBytes), event.Data.RequestID,
 			)
 
 			if err != nil {
 				log.Printf("DB Update failed for %s: %v", event.Data.RequestID, err)
-				msg.Nak() // Retry later
+				msg.Nak()
 			} else {
 				log.Printf("Itinerary saved for %s", event.Data.RequestID)
+				msg.Ack()
+			}
+		}
+	}
+}
+
+// consumeImages listens for found images and updates the database
+func (s *Server) consumeImages() {
+	ctx := context.Background()
+	var cons jetstream.Consumer
+
+	// Wait loop for Stream existence
+	for {
+		stream, err := s.js.Stream(ctx, "TRIPS")
+		if err == nil {
+			cons, err = stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+				Durable:       "api-image-writer-v1",
+				FilterSubject: "trips.images",
+				AckPolicy:     jetstream.AckExplicitPolicy,
+				AckWait:       30 * time.Second,
+			})
+			if err == nil {
+				break
+			}
+		}
+		log.Printf("Waiting for TRIPS stream (images)... (%v)", err)
+		time.Sleep(3 * time.Second)
+	}
+
+	log.Println("Background Consumer: Listening for Images...")
+
+	// Helper struct for decoding payload
+	type ImagePayload struct {
+		Data struct {
+			RequestID string          `json:"request_id"`
+			Images    json.RawMessage `json:"images"` // Keep as raw JSON to save directly
+		} `json:"data"`
+	}
+
+	for {
+		msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
+		if err != nil {
+			continue
+		}
+
+		for msg := range msgs.Messages() {
+			var event ImagePayload
+			if err := json.Unmarshal(msg.Data(), &event); err != nil {
+				log.Printf("Invalid image event format: %v", err)
+				msg.Ack()
+				continue
+			}
+
+			// Update DB with images
+			_, err = s.db.Exec(`
+                UPDATE trips 
+                SET images = $1 
+                WHERE request_id = $2`,
+				string(event.Data.Images), event.Data.RequestID,
+			)
+
+			if err != nil {
+				log.Printf("DB Error saving images: %v", err)
+				msg.Nak()
+			} else {
+				log.Printf("Images saved for %s", event.Data.RequestID)
+				msg.Ack()
+			}
+		}
+	}
+}
+
+// consumePlaces listens for found places and updates the database
+func (s *Server) consumePlaces() {
+	ctx := context.Background()
+	var cons jetstream.Consumer
+
+	// Wait loop for Stream existence
+	for {
+		stream, err := s.js.Stream(ctx, "TRIPS")
+		if err == nil {
+			cons, err = stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+				Durable:       "api-places-writer-v1",
+				FilterSubject: "trips.places",
+				AckPolicy:     jetstream.AckExplicitPolicy,
+				AckWait:       30 * time.Second,
+			})
+			if err == nil {
+				break
+			}
+		}
+		log.Printf("Waiting for TRIPS stream (places)... (%v)", err)
+		time.Sleep(3 * time.Second)
+	}
+
+	log.Println("Background Consumer: Listening for Places...")
+
+	// Helper struct for decoding payload
+	type PlacesPayload struct {
+		Data struct {
+			RequestID string          `json:"request_id"`
+			Places    json.RawMessage `json:"places"` // Keep as raw JSON to save directly
+		} `json:"data"`
+	}
+
+	for {
+		msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
+		if err != nil {
+			continue
+		}
+
+		for msg := range msgs.Messages() {
+			var event PlacesPayload
+			if err := json.Unmarshal(msg.Data(), &event); err != nil {
+				log.Printf("Invalid places event format: %v", err)
+				msg.Ack()
+				continue
+			}
+
+			// Update DB with places
+			_, err = s.db.Exec(`
+                UPDATE trips 
+                SET places = $1 
+                WHERE request_id = $2`,
+				string(event.Data.Places), event.Data.RequestID,
+			)
+
+			if err != nil {
+				log.Printf("DB Error saving places: %v", err)
+				msg.Nak()
+			} else {
+				log.Printf("Places saved for %s", event.Data.RequestID)
 				msg.Ack()
 			}
 		}

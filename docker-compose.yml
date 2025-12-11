@@ -61,5 +61,40 @@ services:
       nats:
         condition: service_healthy
 
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  imager:
+    build:
+      context: .
+      dockerfile: Dockerfile.imager
+    environment:
+      - NATS_URL=nats://nats:4222
+      - PEXELS_API_KEY=${PEXELS_API_KEY}
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  places:
+    build:
+      context: .
+      dockerfile: Dockerfile.places
+    environment:
+      - NATS_URL=nats://nats:4222
+      - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
+    depends_on:
+      nats:
+        condition: service_healthy
+
 volumes:
   postgres_data:
