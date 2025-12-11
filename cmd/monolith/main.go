@@ -429,7 +429,8 @@ func (s *Server) setupRoutes() http.Handler {
 
 	// Public routes
 	mux.HandleFunc("/", s.handleRoot)
-	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ping", s.handlePing)   // Fast ping (no DB)
+	mux.HandleFunc("/health", s.handleHealth) // Full health check (with DB)
 	mux.Handle("/metrics", promhttp.Handler())
 
 	// Auth routes
@@ -470,6 +471,13 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 // HEALTH CHECK
 // =====================================================
 
+// handlePing is a fast endpoint that doesn't touch DB (for uptime monitoring)
+func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleHealth checks DB and NATS connectivity (may be slow if DB is cold)
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	health := map[string]interface{}{
 		"status":    "healthy",
