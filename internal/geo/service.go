@@ -1,11 +1,16 @@
 package geo
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/sky-walkerx/trequila/internal/metrics"
 )
 
 type Place struct {
@@ -17,24 +22,58 @@ type Place struct {
 	Description string  `json:"description,omitempty"`
 }
 
+// Coordinates holds lat/lon for caching
+type Coordinates struct {
+	Lat float64 `json:"lat"`
+	Lon float64 `json:"lon"`
+}
+
 type Service struct {
 	apiKey string
 	client *http.Client
+	redis  *redis.Client
 }
 
-func NewService(apiKey string) *Service {
+func NewService(apiKey, redisAddr string) *Service {
+	var rdb *redis.Client
+	if redisAddr != "" {
+		rdb = redis.NewClient(&redis.Options{
+			Addr: redisAddr,
+		})
+	}
+
 	return &Service{
 		apiKey: apiKey,
 		client: &http.Client{Timeout: 10 * time.Second},
+		redis:  rdb,
 	}
 }
 
-// 1. Geocode: Convert "Paris" to Lat/Lon
+// 1. Geocode: Convert "Paris" to Lat/Lon (with Redis caching)
 func (s *Service) GetCoordinates(city string) (float64, float64, error) {
-	safeCity := url.QueryEscape(city)
-	url := fmt.Sprintf("https://api.geoapify.com/v1/geocode/search?text=%s&apiKey=%s&limit=1", safeCity, s.apiKey)
+	ctx := context.Background()
+	cacheKey := fmt.Sprintf("geo:coords:%s", city)
 
-	resp, err := s.client.Get(url)
+	// Check Redis cache first
+	if s.redis != nil {
+		val, err := s.redis.Get(ctx, cacheKey).Result()
+		if err == nil {
+			var coords Coordinates
+			if json.Unmarshal([]byte(val), &coords) == nil {
+				log.Printf("Cache HIT for coordinates: %s", city)
+				metrics.CacheHitsTotal.WithLabelValues("geo_coords").Inc()
+				return coords.Lat, coords.Lon, nil
+			}
+		}
+	}
+
+	log.Printf("Cache MISS for coordinates: %s - fetching from API", city)
+	metrics.CacheMissesTotal.WithLabelValues("geo_coords").Inc()
+
+	safeCity := url.QueryEscape(city)
+	apiURL := fmt.Sprintf("https://api.geoapify.com/v1/geocode/search?text=%s&apiKey=%s&limit=1", safeCity, s.apiKey)
+
+	resp, err := s.client.Get(apiURL)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -57,18 +96,47 @@ func (s *Service) GetCoordinates(city string) (float64, float64, error) {
 		return 0, 0, fmt.Errorf("location not found")
 	}
 
-	return result.Features[0].Properties.Lat, result.Features[0].Properties.Lon, nil
+	lat := result.Features[0].Properties.Lat
+	lon := result.Features[0].Properties.Lon
+
+	// Cache for 7 days (coordinates rarely change)
+	if s.redis != nil {
+		data, _ := json.Marshal(Coordinates{Lat: lat, Lon: lon})
+		s.redis.Set(ctx, cacheKey, data, 7*24*time.Hour)
+	}
+
+	return lat, lon, nil
 }
 
-// 2. SearchPlaces: Find hotels/restaurants near coordinates
+// 2. SearchPlaces: Find hotels/restaurants near coordinates (with Redis caching)
 func (s *Service) SearchPlaces(lat, lon float64, categories string, limit int) ([]Place, error) {
+	ctx := context.Background()
+	// Cache key includes coordinates (rounded to 3 decimals ~100m precision) and category
+	cacheKey := fmt.Sprintf("geo:places:%.3f:%.3f:%s:%d", lat, lon, categories, limit)
+
+	// Check Redis cache first
+	if s.redis != nil {
+		val, err := s.redis.Get(ctx, cacheKey).Result()
+		if err == nil {
+			var places []Place
+			if json.Unmarshal([]byte(val), &places) == nil {
+				log.Printf("Cache HIT for places: %s at (%.3f, %.3f)", categories, lat, lon)
+				metrics.CacheHitsTotal.WithLabelValues("geo_places").Inc()
+				return places, nil
+			}
+		}
+	}
+
+	log.Printf("Cache MISS for places: %s - fetching from API", categories)
+	metrics.CacheMissesTotal.WithLabelValues("geo_places").Inc()
+
 	// Radius: 10km (10000 meters)
-	url := fmt.Sprintf(
+	apiURL := fmt.Sprintf(
 		"https://api.geoapify.com/v2/places?categories=%s&filter=circle:%f,%f,10000&limit=%d&apiKey=%s",
 		categories, lon, lat, limit, s.apiKey, // Note: Geoapify uses (lon, lat) order for circles!
 	)
 
-	resp, err := s.client.Get(url)
+	resp, err := s.client.Get(apiURL)
 	if err != nil {
 		return nil, err
 	}
@@ -102,5 +170,12 @@ func (s *Service) SearchPlaces(lat, lon float64, categories string, limit int) (
 			})
 		}
 	}
+
+	// Cache for 7 days (places don't change frequently)
+	if s.redis != nil && len(places) > 0 {
+		data, _ := json.Marshal(places)
+		s.redis.Set(ctx, cacheKey, data, 7*24*time.Hour)
+	}
+
 	return places, nil
 }

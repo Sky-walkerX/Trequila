@@ -41,7 +41,7 @@ func main() {
 	defer generator.Close()
 
 	// Initialize NATS JetStream connection
-	js := natshelper.ConnectJetStream(natsURL)
+	js, _ := natshelper.ConnectJetStream(natsURL)
 
 	// Create planner service with default configuration
 	plannerConfig := planner.DefaultConfig()

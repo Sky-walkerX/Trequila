@@ -1,6 +1,29 @@
 services:
+  # ===== Reverse Proxy (Caddy) =====
+  caddy:
+    image: caddy:alpine
+    restart: always
+    ports:
+      - "80:80"       # HTTP (redirects to HTTPS)
+      - "443:443"     # HTTPS
+      - "443:443/udp" # HTTP/3 (QUIC)
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data        # SSL certificates
+      - caddy_config:/config    # Caddy config
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   nats:
     image: nats:alpine
+    restart: always
     ports:
       - "4222:4222"   # client
       - "8222:8222"   # monitoring
@@ -39,11 +62,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.api
-    ports:
-      - "8080:8080"
+    restart: always
+    expose:
+      - "8080"  # Only expose to internal network (Caddy proxies to this)
     environment:
       - NATS_URL=nats://nats:4222
       - DB_URL=postgres://postgres:password@db:5432/trequila?sslmode=disable
+      - JWT_SECRET=${JWT_SECRET:-your-super-secret-key-change-in-production}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - GOOGLE_REDIRECT_URL=${GOOGLE_REDIRECT_URL:-http://localhost:8080/auth/google/callback}
     depends_on:
       nats:
         condition: service_healthy
@@ -54,6 +82,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.planner
+    restart: always
     environment:
       - NATS_URL=nats://nats:4222
       - GEMINI_API_KEY=${GEMINI_API_KEY}
@@ -63,6 +92,7 @@ services:
 
   redis:
     image: redis:alpine
+    restart: always
     ports:
       - "6379:6379"
     healthcheck:
@@ -75,6 +105,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.imager
+    restart: always
     environment:
       - NATS_URL=nats://nats:4222
       - PEXELS_API_KEY=${PEXELS_API_KEY}
@@ -89,12 +120,51 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.places
+    restart: always
     environment:
       - NATS_URL=nats://nats:4222
       - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
+      - REDIS_ADDR=redis:6379
     depends_on:
       nats:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
 
 volumes:
   postgres_data:
+  prometheus_data:
+  grafana_data:
+  caddy_data:
+  caddy_config:

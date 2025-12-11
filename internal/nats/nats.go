@@ -11,7 +11,8 @@ import (
 
 // ConnectJetStream establishes a connection to NATS and initializes JetStream.
 // It also ensures the TRIPS stream exists with proper configuration.
-func ConnectJetStream(url string) jetstream.JetStream {
+// Returns both the JetStream interface and the underlying NATS connection.
+func ConnectJetStream(url string) (jetstream.JetStream, *nats.Conn) {
 	// 1. Connect to NATS server
 	nc, err := nats.Connect(url,
 		nats.Name("Trequila Service"),     // Identifies this client in NATS
@@ -55,5 +56,5 @@ func ConnectJetStream(url string) jetstream.JetStream {
 
 	log.Printf("JetStream connected. Stream: %s, Subjects: %v", stream.CachedInfo().Config.Name, stream.CachedInfo().Config.Subjects)
 
-	return js
+	return js, nc
 }

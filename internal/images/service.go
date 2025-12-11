@@ -9,12 +9,13 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/sky-walkerx/trequila/internal/metrics"
 )
 
 type Image struct {
-	URL         string `json:"url"`
+	URL          string `json:"url"`
 	Photographer string `json:"photographer"`
-	Alt         string `json:"alt"`
+	Alt          string `json:"alt"`
 }
 
 type Service struct {
@@ -46,6 +47,7 @@ func (s *Service) GetImages(ctx context.Context, query string) ([]Image, error) 
 		var images []Image
 		if json.Unmarshal([]byte(val), &images) == nil {
 			fmt.Println("Cache Hit for", query)
+			metrics.CacheHitsTotal.WithLabelValues("images").Inc()
 			return images, nil
 		}
 	}
@@ -57,14 +59,15 @@ func (s *Service) GetImages(ctx context.Context, query string) ([]Image, error) 
 
 	// 3. Call External API (Pexels)
 	fmt.Println("Fetching from Pexels for", query)
+	metrics.CacheMissesTotal.WithLabelValues("images").Inc()
 	images, err := s.fetchFromPexels(query)
 	if err != nil {
 		return nil, err
 	}
 
-	// 4. Save to Cache (24 Hour TTL)
+	// 4. Save to Cache (7 Day TTL)
 	data, _ := json.Marshal(images)
-	s.redis.Set(ctx, cacheKey, data, 24*time.Hour)
+	s.redis.Set(ctx, cacheKey, data, 7*24*time.Hour)
 
 	return images, nil
 }
@@ -72,7 +75,7 @@ func (s *Service) GetImages(ctx context.Context, query string) ([]Image, error) 
 func (s *Service) checkRateLimit(ctx context.Context) error {
 	// Simple sliding window counter
 	key := "ratelimit:pexels"
-	
+
 	// Increment counter
 	count, err := s.redis.Incr(ctx, key).Result()
 	if err != nil {

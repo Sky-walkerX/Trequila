@@ -15,8 +15,13 @@ import (
 
 func main() {
 	apiKey := os.Getenv("GEOAPIFY_API_KEY")
-	js := natshelper.ConnectJetStream(os.Getenv("NATS_URL"))
-	geoSvc := geo.NewService(apiKey)
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "redis:6379"
+	}
+
+	js, _ := natshelper.ConnectJetStream(os.Getenv("NATS_URL"))
+	geoSvc := geo.NewService(apiKey, redisAddr)
 
 	// Consume TRIP REQUESTS
 	ctx := context.Background()
@@ -31,13 +36,15 @@ func main() {
 
 	for {
 		msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 
 		for msg := range msgs.Messages() {
 			var event types.TripEvent
 			json.Unmarshal(msg.Data(), &event)
 			dest := event.Data.Destination
-			
+
 			log.Printf("Finding places for %s...", dest)
 
 			// 1. Geocode
@@ -64,13 +71,13 @@ func main() {
 				"request_id": event.Data.RequestID,
 				"places":     result,
 			}
-			
+
 			// 4. Publish
 			data, _ := json.Marshal(map[string]interface{}{
 				"type": "PlacesFound",
 				"data": payload,
 			})
-			
+
 			js.Publish(ctx, "trips.places", data)
 			msg.Ack()
 			log.Printf("Places found for %s", dest)

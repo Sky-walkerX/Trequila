@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/sky-walkerx/trequila/internal/images"
 	natshelper "github.com/sky-walkerx/trequila/internal/nats"
@@ -32,7 +33,7 @@ func main() {
 
 	// Initialize Services
 	imgSvc := images.NewService(redisAddr, apiKey)
-	js := natshelper.ConnectJetStream(os.Getenv("NATS_URL"))
+	js, _ := natshelper.ConnectJetStream(os.Getenv("NATS_URL"))
 
 	// Consume TRIP REQUESTS (Parallel to Planner)
 	ctx, cancel := context.WithCancel(context.Background())
