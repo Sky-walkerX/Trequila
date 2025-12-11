@@ -55,7 +55,7 @@ func main() {
 
 	// 2. Initialize NATS JetStream (external service)
 	log.Println("Connecting to NATS...")
-	js, nc := natshelper.ConnectJetStream(config.NatsURL, config.NatsCredsFile)
+	js, nc := natshelper.ConnectJetStream(config.NatsURL, config.NatsCredsFile, config.NatsCreds)
 	log.Println("Connected to NATS")
 
 	// 3. Initialize PostgreSQL
@@ -143,6 +143,7 @@ type Config struct {
 	Port           string
 	NatsURL        string
 	NatsCredsFile  string
+	NatsCreds      string // Inline credentials content (for Heroku)
 	DatabaseURL    string
 	RedisAddr      string
 	GeminiAPIKey   string
@@ -155,7 +156,8 @@ func loadConfig() Config {
 	config := Config{
 		Port:           getEnv("PORT", "8080"),
 		NatsURL:        getEnv("NATS_URL", nats.DefaultURL),
-		NatsCredsFile:  os.Getenv("NATS_CREDS_FILE"), // Path to .creds file for Synadia NGS
+		NatsCredsFile:  os.Getenv("NATS_CREDS_FILE"), // Path to .creds file (local)
+		NatsCreds:      os.Getenv("NATS_CREDS"),      // Inline creds content (Heroku)
 		DatabaseURL:    getEnv("DATABASE_URL", getEnv("DB_URL", "postgres://postgres:password@localhost:5432/trequila?sslmode=disable")),
 		RedisAddr:      getEnv("REDIS_URL", getEnv("REDIS_ADDR", "localhost:6379")),
 		GeminiAPIKey:   os.Getenv("GEMINI_API_KEY"),

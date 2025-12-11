@@ -3,6 +3,7 @@ package nats
 import (
 	"context"
 	"log"
+	"os"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -10,16 +11,14 @@ import (
 )
 
 // ConnectJetStream establishes a connection to NATS and initializes JetStream.
-// It also ensures the TRIPS stream exists with proper configuration.
-// Returns both the JetStream interface and the underlying NATS connection.
-// 
-// For Synadia NGS, pass credsFile path to authenticate with credentials file.
-func ConnectJetStream(url string, credsFile ...string) (jetstream.JetStream, *nats.Conn) {
-	// Build connection options
+// Supports two auth modes:
+//   - credsFile: path to .creds file (local dev)
+//   - credsContent: raw credentials content (Heroku - stored in env var)
+func ConnectJetStream(url, credsFile, credsContent string) (jetstream.JetStream, *nats.Conn) {
 	opts := []nats.Option{
-		nats.Name("Trequila Service"),     // Identifies this client in NATS
-		nats.ReconnectWait(2*time.Second), // Wait 2s before reconnecting
-		nats.MaxReconnects(-1),            // Unlimited reconnect attempts
+		nats.Name("Trequila Service"),
+		nats.ReconnectWait(2*time.Second),
+		nats.MaxReconnects(-1),
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			log.Printf("NATS disconnected: %v", err)
 		}),
@@ -28,13 +27,23 @@ func ConnectJetStream(url string, credsFile ...string) (jetstream.JetStream, *na
 		}),
 	}
 
-	// Add credentials file if provided (for Synadia NGS)
-	if len(credsFile) > 0 && credsFile[0] != "" {
-		log.Printf("Using NATS credentials file: %s", credsFile[0])
-		opts = append(opts, nats.UserCredentials(credsFile[0]))
+	// Priority: inline content > file path
+	if credsContent != "" {
+		log.Println("Using inline NATS credentials (NATS_CREDS)")
+		tmpFile, err := os.CreateTemp("", "nats-*.creds")
+		if err != nil {
+			log.Fatalf("Failed to create temp creds file: %v", err)
+		}
+		if _, err := tmpFile.WriteString(credsContent); err != nil {
+			log.Fatalf("Failed to write creds: %v", err)
+		}
+		tmpFile.Close()
+		opts = append(opts, nats.UserCredentials(tmpFile.Name()))
+	} else if credsFile != "" {
+		log.Printf("Using NATS credentials file: %s", credsFile)
+		opts = append(opts, nats.UserCredentials(credsFile))
 	}
 
-	// 1. Connect to NATS server
 	nc, err := nats.Connect(url, opts...)
 	if err != nil {
 		log.Fatalf("NATS connect error: %v", err)
