@@ -12,9 +12,11 @@ import (
 // ConnectJetStream establishes a connection to NATS and initializes JetStream.
 // It also ensures the TRIPS stream exists with proper configuration.
 // Returns both the JetStream interface and the underlying NATS connection.
-func ConnectJetStream(url string) (jetstream.JetStream, *nats.Conn) {
-	// 1. Connect to NATS server
-	nc, err := nats.Connect(url,
+// 
+// For Synadia NGS, pass credsFile path to authenticate with credentials file.
+func ConnectJetStream(url string, credsFile ...string) (jetstream.JetStream, *nats.Conn) {
+	// Build connection options
+	opts := []nats.Option{
 		nats.Name("Trequila Service"),     // Identifies this client in NATS
 		nats.ReconnectWait(2*time.Second), // Wait 2s before reconnecting
 		nats.MaxReconnects(-1),            // Unlimited reconnect attempts
@@ -24,7 +26,16 @@ func ConnectJetStream(url string) (jetstream.JetStream, *nats.Conn) {
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			log.Printf("NATS reconnected to %s", nc.ConnectedUrl())
 		}),
-	)
+	}
+
+	// Add credentials file if provided (for Synadia NGS)
+	if len(credsFile) > 0 && credsFile[0] != "" {
+		log.Printf("Using NATS credentials file: %s", credsFile[0])
+		opts = append(opts, nats.UserCredentials(credsFile[0]))
+	}
+
+	// 1. Connect to NATS server
+	nc, err := nats.Connect(url, opts...)
 	if err != nil {
 		log.Fatalf("NATS connect error: %v", err)
 	}

@@ -4,6 +4,10 @@
 .env.*.local
 *.env
 
+# NATS credentials (sensitive!)
+*.creds
+trequila.creds
+
 # Go binaries
 *.exe
 *.exe~
@@ -63,3 +67,4 @@ local.yml
 local.yaml
 config.local.*
 .env
+trequila.creds

@@ -1,3 +1,6 @@
+// cmd/monolith/main.go
+// Monolith service - combines API, Planner, Imager, and Places into a single binary
+// Uses external NATS for event-driven communication between goroutines
 package main
 
 import (
@@ -15,19 +18,24 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	_ "github.com/jackc/pgx/v5/stdlib" // Standard library adapter for pgx
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sky-walkerx/trequila/internal/ai"
+	"github.com/sky-walkerx/trequila/internal/ai/gemini"
 	"github.com/sky-walkerx/trequila/internal/auth"
+	"github.com/sky-walkerx/trequila/internal/geo"
+	"github.com/sky-walkerx/trequila/internal/images"
 	"github.com/sky-walkerx/trequila/internal/metrics"
 	"github.com/sky-walkerx/trequila/internal/middleware"
 	natshelper "github.com/sky-walkerx/trequila/internal/nats"
+	"github.com/sky-walkerx/trequila/internal/planner"
 	"github.com/sky-walkerx/trequila/internal/types"
 	"golang.org/x/time/rate"
 )
 
-// Server holds shared dependencies for the API
+// Server holds shared dependencies
 type Server struct {
 	js   jetstream.JetStream
 	nc   *nats.Conn
@@ -36,31 +44,34 @@ type Server struct {
 }
 
 func main() {
-	// 1. Initialize NATS
-	natsURL := os.Getenv("NATS_URL")
-	if natsURL == "" {
-		natsURL = nats.DefaultURL
-	}
-	js, nc := natshelper.ConnectJetStream(natsURL)
+	log.Println("=== Trequila Monolith Starting ===")
 
-	// 2. Initialize Postgres
-	dbURL := os.Getenv("DB_URL")
-	if dbURL == "" {
-		// Default for local docker-compose
-		dbURL = "postgres://postgres:password@db:5432/trequila?sslmode=disable"
-	}
+	// Create root context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	db, err := sql.Open("pgx", dbURL)
+	// 1. Load and validate environment variables
+	config := loadConfig()
+
+	// 2. Initialize NATS JetStream (external service)
+	log.Println("Connecting to NATS...")
+	js, nc := natshelper.ConnectJetStream(config.NatsURL, config.NatsCredsFile)
+	log.Println("Connected to NATS")
+
+	// 3. Initialize PostgreSQL
+	log.Println("Connecting to PostgreSQL...")
+	db, err := sql.Open("pgx", config.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Unable to parse DB URL: %v", err)
 	}
 	defer db.Close()
 
-	// Wait for DB to be healthy
 	if err := waitForDB(db); err != nil {
 		log.Fatalf("Could not connect to database: %v", err)
 	}
+	log.Println("Connected to PostgreSQL")
 
+	// 4. Initialize services
 	server := &Server{
 		js:   js,
 		nc:   nc,
@@ -68,103 +79,389 @@ func main() {
 		auth: auth.NewAuthService(db),
 	}
 
-	// 3. Start Background Consumers
-	// A. Listens for completed itineraries
-	go server.consumeItineraries()
+	// 5. Start background workers (microservices as goroutines)
 
-	// B. Listens for found images
-	go server.consumeImages()
+	// API consumers (save results to DB)
+	go server.consumeItineraries(ctx)
+	go server.consumeImages(ctx)
+	go server.consumePlaces(ctx)
+	log.Println("Started API consumers")
 
-	// C. Listens for found places
-	go server.consumePlaces()
+	// Planner worker (AI itinerary generation)
+	go startPlannerWorker(ctx, js, config.GeminiAPIKey)
+	log.Println("Started Planner worker")
 
-	// 4. Setup Middleware
-	// Rate limiter: 10 requests per second, burst of 20
-	rateLimiter := middleware.NewRateLimiter(rate.Limit(10), 20)
+	// Imager worker (fetch destination images)
+	go startImagerWorker(ctx, js, config.PexelsAPIKey, config.RedisAddr)
+	log.Println("Started Imager worker")
 
-	// CORS config
-	corsConfig := middleware.DefaultCORSConfig()
-	// In production, set specific origins:
-	// corsConfig.AllowedOrigins = []string{"https://your-frontend.com"}
+	// Places worker (fetch POIs)
+	go startPlacesWorker(ctx, js, config.GeoapifyAPIKey, config.RedisAddr)
+	log.Println("Started Places worker")
 
-	// 5. Setup Router with middleware
-	mux := http.NewServeMux()
+	// 6. Setup HTTP server
+	handler := server.setupRoutes()
 
-	// Public routes (no auth required)
-	mux.HandleFunc("/health", server.handleHealth)
-	mux.Handle("/metrics", promhttp.Handler())
-
-	// Auth routes
-	mux.HandleFunc("/auth/register", server.handleRegister)
-	mux.HandleFunc("/auth/login", server.handleLogin)
-	mux.HandleFunc("/auth/google/login", server.handleGoogleLogin)
-	mux.HandleFunc("/auth/google/callback", server.handleGoogleCallback)
-	mux.HandleFunc("/auth/token", server.handleGenerateToken) // For testing/dev
-	
-	// User profile (protected)
-	mux.Handle("/api/me", server.auth.AuthMiddleware(
-		http.HandlerFunc(server.handleGetCurrentUser),
-	))
-
-	// Protected routes (auth required) - wrap with auth middleware
-	mux.Handle("/api/trips", server.auth.AuthMiddleware(
-		http.HandlerFunc(server.instrumentHandler("/api/trips", server.handleTrips)),
-	))
-	mux.Handle("/api/trips/", server.auth.AuthMiddleware(
-		http.HandlerFunc(server.instrumentHandler("/api/trips/{id}", server.handleTripByID)),
-	))
-
-	// Apply middleware chain: CORS -> RateLimit -> Handler
-	handler := middleware.CORS(corsConfig)(rateLimiter.Limit(mux))
-
-	// 6. Create server with graceful shutdown
+	port := config.Port
 	srv := &http.Server{
-		Addr:         ":8080",
+		Addr:         ":" + port,
 		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 60 * time.Second, // Longer for SSE
+		WriteTimeout: 120 * time.Second, // Longer for SSE
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Start server in goroutine
+	// Start HTTP server
 	go func() {
-		log.Println("API server listening on :8080")
+		log.Printf("HTTP server listening on :%s", port)
+		log.Println("=== Trequila Monolith Ready ===")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
 		}
 	}()
 
-	// Graceful shutdown
+	// 7. Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("Shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	log.Println("Shutting down...")
+	cancel() // Cancel context to stop all workers
 
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
 	}
 
-	log.Println("Server exited gracefully")
+	log.Println("Trequila Monolith stopped")
 }
 
-// waitForDB loops until the database is ready
+// Config holds all configuration
+type Config struct {
+	Port           string
+	NatsURL        string
+	NatsCredsFile  string
+	DatabaseURL    string
+	RedisAddr      string
+	GeminiAPIKey   string
+	PexelsAPIKey   string
+	GeoapifyAPIKey string
+	JWTSecret      string
+}
+
+func loadConfig() Config {
+	config := Config{
+		Port:           getEnv("PORT", "8080"),
+		NatsURL:        getEnv("NATS_URL", nats.DefaultURL),
+		NatsCredsFile:  os.Getenv("NATS_CREDS_FILE"), // Path to .creds file for Synadia NGS
+		DatabaseURL:    getEnv("DATABASE_URL", getEnv("DB_URL", "postgres://postgres:password@localhost:5432/trequila?sslmode=disable")),
+		RedisAddr:      getEnv("REDIS_URL", getEnv("REDIS_ADDR", "localhost:6379")),
+		GeminiAPIKey:   os.Getenv("GEMINI_API_KEY"),
+		PexelsAPIKey:   os.Getenv("PEXELS_API_KEY"),
+		GeoapifyAPIKey: os.Getenv("GEOAPIFY_API_KEY"),
+		JWTSecret:      getEnv("JWT_SECRET", "dev-secret-change-in-production"),
+	}
+
+	// Validate required keys
+	if config.GeminiAPIKey == "" {
+		log.Println("WARNING: GEMINI_API_KEY not set - Planner will fail")
+	}
+	if config.PexelsAPIKey == "" {
+		log.Println("WARNING: PEXELS_API_KEY not set - Imager will fail")
+	}
+	if config.GeoapifyAPIKey == "" {
+		log.Println("WARNING: GEOAPIFY_API_KEY not set - Places will fail")
+	}
+
+	return config
+}
+
+func getEnv(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
 func waitForDB(db *sql.DB) error {
-	var err error
-	for i := 0; i < 15; i++ {
-		if err = db.Ping(); err == nil {
-			log.Println("Connected to PostgreSQL")
+	for i := 0; i < 30; i++ {
+		if err := db.Ping(); err == nil {
 			return nil
 		}
-		log.Printf("Waiting for DB... (%v)", err)
+		log.Printf("Waiting for database... (attempt %d/30)", i+1)
 		time.Sleep(2 * time.Second)
 	}
-	return fmt.Errorf("timeout waiting for db")
+	return fmt.Errorf("timeout waiting for database")
 }
 
-// ===== Health Check =====
+// =====================================================
+// PLANNER WORKER
+// =====================================================
+
+func startPlannerWorker(ctx context.Context, js jetstream.JetStream, apiKey string) {
+	if apiKey == "" {
+		log.Println("Planner: Skipping - no API key")
+		return
+	}
+
+	// Initialize Gemini AI
+	aiConfig := ai.DefaultConfig(apiKey)
+	generator, err := gemini.New(ctx, aiConfig)
+	if err != nil {
+		log.Printf("Planner: Failed to initialize Gemini: %v", err)
+		return
+	}
+	defer generator.Close()
+
+	// Create planner service
+	plannerConfig := planner.DefaultConfig()
+	svc, err := planner.New(js, generator, plannerConfig)
+	if err != nil {
+		log.Printf("Planner: Failed to create service: %v", err)
+		return
+	}
+	defer svc.Stop()
+
+	log.Println("Planner: Processing trip requests...")
+	if err := svc.Start(ctx, "TRIPS"); err != nil && err != context.Canceled {
+		log.Printf("Planner: Error: %v", err)
+	}
+}
+
+// =====================================================
+// IMAGER WORKER
+// =====================================================
+
+func startImagerWorker(ctx context.Context, js jetstream.JetStream, apiKey, redisAddr string) {
+	if apiKey == "" {
+		log.Println("Imager: Skipping - no API key")
+		return
+	}
+
+	imgSvc := images.NewService(redisAddr, apiKey)
+
+	// Wait for stream to be available
+	var stream jetstream.Stream
+	var err error
+	for i := 0; i < 30; i++ {
+		stream, err = js.Stream(ctx, "TRIPS")
+		if err == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Printf("Imager: Failed to get stream: %v", err)
+		return
+	}
+
+	cons, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable:       "imager-worker-v1",
+		FilterSubject: "trips.requested",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       30 * time.Second,
+	})
+	if err != nil {
+		log.Printf("Imager: Failed to create consumer: %v", err)
+		return
+	}
+
+	log.Println("Imager: Processing image requests...")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
+		if err != nil {
+			continue
+		}
+
+		for msg := range msgs.Messages() {
+			var event types.TripEvent
+			if err := json.Unmarshal(msg.Data(), &event); err != nil {
+				msg.Ack()
+				continue
+			}
+
+			reqID := event.Data.RequestID
+			dest := event.Data.Destination
+			log.Printf("Imager: Fetching images for %s (%s)", reqID, dest)
+
+			imgs, err := imgSvc.GetImages(ctx, dest)
+			if err != nil {
+				log.Printf("Imager: Fetch failed: %v", err)
+				msg.Nak()
+				continue
+			}
+
+			resEvent := map[string]interface{}{
+				"type": "ImagesFound",
+				"data": map[string]interface{}{
+					"request_id": reqID,
+					"images":     imgs,
+				},
+			}
+
+			data, _ := json.Marshal(resEvent)
+			js.Publish(ctx, "trips.images", data)
+			msg.Ack()
+			log.Printf("Imager: Images found for %s", reqID)
+		}
+	}
+}
+
+// =====================================================
+// PLACES WORKER
+// =====================================================
+
+func startPlacesWorker(ctx context.Context, js jetstream.JetStream, apiKey, redisAddr string) {
+	if apiKey == "" {
+		log.Println("Places: Skipping - no API key")
+		return
+	}
+
+	geoSvc := geo.NewService(apiKey, redisAddr)
+
+	// Wait for stream
+	var stream jetstream.Stream
+	var err error
+	for i := 0; i < 30; i++ {
+		stream, err = js.Stream(ctx, "TRIPS")
+		if err == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Printf("Places: Failed to get stream: %v", err)
+		return
+	}
+
+	cons, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable:       "places-worker-v1",
+		FilterSubject: "trips.requested",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       30 * time.Second,
+	})
+	if err != nil {
+		log.Printf("Places: Failed to create consumer: %v", err)
+		return
+	}
+
+	log.Println("Places: Processing place requests...")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
+		if err != nil {
+			continue
+		}
+
+		for msg := range msgs.Messages() {
+			var event types.TripEvent
+			if err := json.Unmarshal(msg.Data(), &event); err != nil {
+				msg.Ack()
+				continue
+			}
+
+			dest := event.Data.Destination
+			reqID := event.Data.RequestID
+			log.Printf("Places: Finding places for %s (%s)", reqID, dest)
+
+			lat, lon, err := geoSvc.GetCoordinates(dest)
+			if err != nil {
+				log.Printf("Places: Geocode failed: %v", err)
+				msg.Nak()
+				continue
+			}
+
+			hotels, _ := geoSvc.SearchPlaces(lat, lon, "accommodation.hotel", 5)
+			restaurants, _ := geoSvc.SearchPlaces(lat, lon, "catering.restaurant", 5)
+			attractions, _ := geoSvc.SearchPlaces(lat, lon, "tourism.attraction", 5)
+
+			result := map[string]interface{}{
+				"type": "PlacesFound",
+				"data": map[string]interface{}{
+					"request_id": reqID,
+					"places": map[string]interface{}{
+						"hotels":      hotels,
+						"restaurants": restaurants,
+						"attractions": attractions,
+					},
+				},
+			}
+
+			data, _ := json.Marshal(result)
+			js.Publish(ctx, "trips.places", data)
+			msg.Ack()
+			log.Printf("Places: Found places for %s", reqID)
+		}
+	}
+}
+
+// =====================================================
+// HTTP ROUTES SETUP
+// =====================================================
+
+func (s *Server) setupRoutes() http.Handler {
+	rateLimiter := middleware.NewRateLimiter(rate.Limit(10), 20)
+	corsConfig := middleware.DefaultCORSConfig()
+
+	mux := http.NewServeMux()
+
+	// Public routes
+	mux.HandleFunc("/", s.handleRoot)
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// Auth routes
+	mux.HandleFunc("/auth/register", s.handleRegister)
+	mux.HandleFunc("/auth/login", s.handleLogin)
+	mux.HandleFunc("/auth/google/login", s.handleGoogleLogin)
+	mux.HandleFunc("/auth/google/callback", s.handleGoogleCallback)
+	mux.HandleFunc("/auth/token", s.handleGenerateToken)
+
+	// Protected routes
+	mux.Handle("/api/me", s.auth.AuthMiddleware(
+		http.HandlerFunc(s.handleGetCurrentUser),
+	))
+	mux.Handle("/api/trips", s.auth.AuthMiddleware(
+		http.HandlerFunc(s.instrumentHandler("/api/trips", s.handleTrips)),
+	))
+	mux.Handle("/api/trips/", s.auth.AuthMiddleware(
+		http.HandlerFunc(s.instrumentHandler("/api/trips/{id}", s.handleTripByID)),
+	))
+
+	return middleware.CORS(corsConfig)(rateLimiter.Limit(mux))
+}
+
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"name":    "Trequila API",
+		"version": "1.0.0",
+		"docs":    "/health",
+	})
+}
+
+// =====================================================
+// HEALTH CHECK
+// =====================================================
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	health := map[string]interface{}{
@@ -175,7 +472,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	services := health["services"].(map[string]string)
 
-	// Check DB
 	if err := s.db.Ping(); err != nil {
 		services["database"] = "unhealthy"
 		health["status"] = "degraded"
@@ -183,7 +479,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		services["database"] = "healthy"
 	}
 
-	// Check NATS
 	if s.nc.IsConnected() {
 		services["nats"] = "healthy"
 	} else {
@@ -200,19 +495,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
-// ===== Auth Handlers =====
+// =====================================================
+// AUTH HANDLERS
+// =====================================================
 
 func (s *Server) handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
-	// Generate state for CSRF protection
 	state := uuid.NewString()
-
-	// In production, store state in session/cookie for validation
 	url := s.auth.GoogleLoginURL(state)
 	if url == "" {
 		http.Error(w, `{"error":"google oauth not configured"}`, http.StatusNotImplemented)
 		return
 	}
-
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
 
@@ -223,8 +516,6 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// In production, validate state parameter here
-
 	user, token, err := s.auth.HandleGoogleCallback(r.Context(), code)
 	if err != nil {
 		log.Printf("Google callback error: %v", err)
@@ -232,7 +523,6 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return token to client
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"token": token,
@@ -244,8 +534,6 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGenerateToken is for testing/development - generates a token for a user
-// This creates a real user in the database to avoid FK constraint violations
 func (s *Server) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -263,7 +551,6 @@ func (s *Server) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate IDs if not provided
 	if req.UserID == "" {
 		req.UserID = uuid.NewString()
 	}
@@ -274,7 +561,7 @@ func (s *Server) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 		req.Name = "Dev User"
 	}
 
-	// Create or update user in database to satisfy FK constraint
+	// Create user in DB
 	_, err := s.db.Exec(`
 		INSERT INTO users (id, email, name, provider)
 		VALUES ($1, $2, $3, 'dev')
@@ -282,7 +569,6 @@ func (s *Server) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 		req.UserID, req.Email, req.Name,
 	)
 	if err != nil {
-		// Try with a unique email if there's a conflict
 		req.Email = fmt.Sprintf("dev-%s@trequila.local", req.UserID)
 		_, err = s.db.Exec(`
 			INSERT INTO users (id, email, name, provider)
@@ -303,19 +589,15 @@ func (s *Server) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Dev token created for user: %s (%s)", req.UserID, req.Email)
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"token":   token,
 		"user_id": req.UserID,
 		"email":   req.Email,
-		"name":    req.Name,
-		"warning": "This endpoint is for development only. Do not use in production.",
+		"warning": "Development endpoint only",
 	})
 }
 
-// handleRegister handles user registration with email/password
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -358,7 +640,6 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleLogin handles user login with email/password
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -379,8 +660,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		status := http.StatusUnauthorized
 		switch err {
-		case auth.ErrUserNotFound, auth.ErrInvalidPassword:
-			status = http.StatusUnauthorized
 		case auth.ErrInvalidEmail, auth.ErrPasswordRequired:
 			status = http.StatusBadRequest
 		}
@@ -399,7 +678,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGetCurrentUser returns the current authenticated user's info
 func (s *Server) handleGetCurrentUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -433,9 +711,32 @@ func (s *Server) handleGetCurrentUser(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ===== Protected Trip Handlers =====
+// =====================================================
+// TRIP HANDLERS
+// =====================================================
 
-// handleTrips handles GET (list) and POST (create) for authenticated users
+func (s *Server) instrumentHandler(path string, handler func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		handler(wrapped, r)
+		duration := time.Since(start).Seconds()
+		status := strconv.Itoa(wrapped.statusCode)
+		metrics.HttpRequestsTotal.WithLabelValues(r.Method, path, status).Inc()
+		metrics.HttpRequestDuration.WithLabelValues(r.Method, path).Observe(duration)
+	}
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
 func (s *Server) handleTrips(w http.ResponseWriter, r *http.Request) {
 	userID := auth.GetUserIDFromContext(r.Context())
 	if userID == "" {
@@ -453,7 +754,6 @@ func (s *Server) handleTrips(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleTripByID handles GET, DELETE for a specific trip (authenticated)
 func (s *Server) handleTripByID(w http.ResponseWriter, r *http.Request) {
 	userID := auth.GetUserIDFromContext(r.Context())
 	if userID == "" {
@@ -461,18 +761,14 @@ func (s *Server) handleTripByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract ID from path: /api/trips/{id}
 	path := r.URL.Path
-	id := ""
-
-	// Handle both /api/trips/{id} and /api/trips/stream/{id}
 	if strings.HasPrefix(path, "/api/trips/stream/") {
-		id = strings.TrimPrefix(path, "/api/trips/stream/")
+		id := strings.TrimPrefix(path, "/api/trips/stream/")
 		s.handleStreamTripAuth(w, r, userID, id)
 		return
 	}
 
-	id = strings.TrimPrefix(path, "/api/trips/")
+	id := strings.TrimPrefix(path, "/api/trips/")
 	if id == "" {
 		http.Error(w, `{"error":"trip id required"}`, http.StatusBadRequest)
 		return
@@ -488,9 +784,7 @@ func (s *Server) handleTripByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleListUserTrips returns all trips for the authenticated user
 func (s *Server) handleListUserTrips(w http.ResponseWriter, r *http.Request, userID string) {
-	// Parse query params for pagination
 	page := 1
 	limit := 10
 
@@ -506,26 +800,15 @@ func (s *Server) handleListUserTrips(w http.ResponseWriter, r *http.Request, use
 	}
 	offset := (page - 1) * limit
 
-	// Get total count
 	var total int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM trips WHERE user_id = $1`, userID).Scan(&total)
-	if err != nil {
-		log.Printf("DB count error: %v", err)
-		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
-		return
-	}
+	s.db.QueryRow(`SELECT COUNT(*) FROM trips WHERE user_id = $1`, userID).Scan(&total)
 
-	// Get trips with pagination
 	rows, err := s.db.Query(`
 		SELECT request_id, source, destination, start_date, end_date, budget, status, created_at
-		FROM trips 
-		WHERE user_id = $1 
-		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3`,
+		FROM trips WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
 		userID, limit, offset,
 	)
 	if err != nil {
-		log.Printf("DB query error: %v", err)
 		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -569,7 +852,6 @@ func (s *Server) handleListUserTrips(w http.ResponseWriter, r *http.Request, use
 	})
 }
 
-// handleCreateUserTrip creates a new trip for the authenticated user
 func (s *Server) handleCreateUserTrip(w http.ResponseWriter, r *http.Request, userID string) {
 	var req struct {
 		Source      string   `json:"source"`
@@ -586,20 +868,19 @@ func (s *Server) handleCreateUserTrip(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	// Validation
 	if req.Source == "" || req.Destination == "" || req.StartDate == "" || req.EndDate == "" {
-		http.Error(w, `{"error":"missing required fields: source, destination, start_date, end_date"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"missing required fields"}`, http.StatusBadRequest)
 		return
 	}
 
 	startDate, err := time.Parse("2006-01-02", req.StartDate)
 	if err != nil {
-		http.Error(w, `{"error":"invalid start_date format, use YYYY-MM-DD"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"invalid start_date format"}`, http.StatusBadRequest)
 		return
 	}
 	endDate, err := time.Parse("2006-01-02", req.EndDate)
 	if err != nil {
-		http.Error(w, `{"error":"invalid end_date format, use YYYY-MM-DD"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"invalid end_date format"}`, http.StatusBadRequest)
 		return
 	}
 	if endDate.Before(startDate) {
@@ -607,14 +888,12 @@ func (s *Server) handleCreateUserTrip(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	// Calculate days
 	if req.Days == 0 {
 		req.Days = int(endDate.Sub(startDate).Hours()/24) + 1
 	}
 
 	requestID := uuid.NewString()
 
-	// Insert into DB
 	_, err = s.db.Exec(`
 		INSERT INTO trips (request_id, user_id, source, destination, start_date, end_date, budget, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
@@ -626,7 +905,6 @@ func (s *Server) handleCreateUserTrip(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	// Publish to NATS
 	event := types.TripEvent{
 		Type: "TripRequested",
 		Data: types.TripRequest{
@@ -647,16 +925,14 @@ func (s *Server) handleCreateUserTrip(w http.ResponseWriter, r *http.Request, us
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	ack, err := s.js.Publish(ctx, "trips.requested", data, jetstream.WithMsgID(requestID))
+	_, err = s.js.Publish(ctx, "trips.requested", data, jetstream.WithMsgID(requestID))
 	if err != nil {
 		log.Printf("NATS Publish error: %v", err)
 		http.Error(w, `{"error":"failed to queue trip"}`, http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("Trip requested by user %s: %s (seq: %d)", userID, requestID, ack.Sequence)
 	metrics.TripsCreatedTotal.Inc()
-	metrics.NatsMessagesPublished.WithLabelValues("trips.requested").Inc()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -667,19 +943,16 @@ func (s *Server) handleCreateUserTrip(w http.ResponseWriter, r *http.Request, us
 	})
 }
 
-// handleGetUserTrip returns detailed trip info for the authenticated user
 func (s *Server) handleGetUserTrip(w http.ResponseWriter, r *http.Request, userID, tripID string) {
-	var status string
-	var source, destination, startDate, endDate string
+	var status, source, destination, startDate, endDate string
 	var budget int
 	var itineraryJSON, imagesJSON, placesJSON []byte
 	var createdAt, updatedAt time.Time
 
 	err := s.db.QueryRow(`
-		SELECT status, source, destination, start_date, end_date, budget, 
+		SELECT status, source, destination, start_date, end_date, budget,
 		       itinerary, images, places, created_at, updated_at
-		FROM trips 
-		WHERE request_id = $1 AND user_id = $2`,
+		FROM trips WHERE request_id = $1 AND user_id = $2`,
 		tripID, userID,
 	).Scan(&status, &source, &destination, &startDate, &endDate, &budget,
 		&itineraryJSON, &imagesJSON, &placesJSON, &createdAt, &updatedAt)
@@ -688,7 +961,6 @@ func (s *Server) handleGetUserTrip(w http.ResponseWriter, r *http.Request, userI
 		http.Error(w, `{"error":"trip not found"}`, http.StatusNotFound)
 		return
 	} else if err != nil {
-		log.Printf("DB Query error: %v", err)
 		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -719,11 +991,9 @@ func (s *Server) handleGetUserTrip(w http.ResponseWriter, r *http.Request, userI
 	json.NewEncoder(w).Encode(resp)
 }
 
-// handleDeleteUserTrip deletes a trip for the authenticated user
 func (s *Server) handleDeleteUserTrip(w http.ResponseWriter, r *http.Request, userID, tripID string) {
 	result, err := s.db.Exec(`DELETE FROM trips WHERE request_id = $1 AND user_id = $2`, tripID, userID)
 	if err != nil {
-		log.Printf("DB Delete error: %v", err)
 		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -735,74 +1005,38 @@ func (s *Server) handleDeleteUserTrip(w http.ResponseWriter, r *http.Request, us
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message": "trip deleted successfully",
-	})
+	json.NewEncoder(w).Encode(map[string]string{"message": "trip deleted successfully"})
 }
 
-// handleStreamTripAuth streams SSE for authenticated users
+// =====================================================
+// SSE STREAMING
+// =====================================================
+
 func (s *Server) handleStreamTripAuth(w http.ResponseWriter, r *http.Request, userID, tripID string) {
-	// Verify user owns this trip
 	var exists bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM trips WHERE request_id = $1 AND user_id = $2)`, tripID, userID).Scan(&exists)
-	if err != nil || !exists {
+	s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM trips WHERE request_id = $1 AND user_id = $2)`, tripID, userID).Scan(&exists)
+	if !exists {
 		http.Error(w, `{"error":"trip not found"}`, http.StatusNotFound)
 		return
 	}
-
-	// Delegate to the existing SSE handler logic
 	s.handleStreamTripInternal(w, r, tripID)
 }
 
-// instrumentHandler wraps handlers with Prometheus metrics
-func (s *Server) instrumentHandler(path string, handler func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-
-		// Wrap ResponseWriter to capture status code
-		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-
-		handler(wrapped, r)
-
-		duration := time.Since(start).Seconds()
-		status := strconv.Itoa(wrapped.statusCode)
-
-		metrics.HttpRequestsTotal.WithLabelValues(r.Method, path, status).Inc()
-		metrics.HttpRequestDuration.WithLabelValues(r.Method, path).Observe(duration)
-	}
-}
-
-// responseWriter wraps http.ResponseWriter to capture status code
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-// handleStreamTripInternal is the shared SSE logic
 func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request, id string) {
-	// Fetch current state from database
 	var status string
 	var imagesJSON, placesJSON, itineraryJSON []byte
 	err := s.db.QueryRow(`
-		SELECT status, images, places, itinerary 
-		FROM trips WHERE request_id = $1`, id,
+		SELECT status, images, places, itinerary FROM trips WHERE request_id = $1`, id,
 	).Scan(&status, &imagesJSON, &placesJSON, &itineraryJSON)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "trip not found", http.StatusNotFound)
 		return
 	} else if err != nil {
-		log.Printf("DB Query error: %v", err)
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -814,98 +1048,56 @@ func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Send initial connection event
 	fmt.Fprintf(w, "event: connected\ndata: {\"request_id\":\"%s\",\"message\":\"Stream connected\"}\n\n", id)
 	flusher.Flush()
 
-	// Track SSE connection
 	metrics.SSEConnectionsActive.Inc()
 	defer metrics.SSEConnectionsActive.Dec()
 
-	// Track what we've received - check DB for already available data
 	receivedImages := len(imagesJSON) > 0
 	receivedPlaces := len(placesJSON) > 0
 	receivedItinerary := len(itineraryJSON) > 0
 
-	// Send already-available data from database immediately
 	if receivedImages {
-		data, _ := json.Marshal(map[string]interface{}{
-			"type":   "images",
-			"images": json.RawMessage(imagesJSON),
-		})
+		data, _ := json.Marshal(map[string]interface{}{"type": "images", "images": json.RawMessage(imagesJSON)})
 		fmt.Fprintf(w, "event: images\ndata: %s\n\n", data)
 		flusher.Flush()
-		metrics.SSEEventsTotal.WithLabelValues("images").Inc()
-		log.Printf("SSE sent cached images for %s", id)
 	}
 
 	if receivedPlaces {
-		data, _ := json.Marshal(map[string]interface{}{
-			"type":   "places",
-			"places": json.RawMessage(placesJSON),
-		})
+		data, _ := json.Marshal(map[string]interface{}{"type": "places", "places": json.RawMessage(placesJSON)})
 		fmt.Fprintf(w, "event: places\ndata: %s\n\n", data)
 		flusher.Flush()
-		metrics.SSEEventsTotal.WithLabelValues("places").Inc()
-		log.Printf("SSE sent cached places for %s", id)
 	}
 
 	if receivedItinerary {
-		data, _ := json.Marshal(map[string]interface{}{
-			"type":      "itinerary",
-			"itinerary": json.RawMessage(itineraryJSON),
-		})
+		data, _ := json.Marshal(map[string]interface{}{"type": "itinerary", "itinerary": json.RawMessage(itineraryJSON)})
 		fmt.Fprintf(w, "event: itinerary\ndata: %s\n\n", data)
 		flusher.Flush()
-		metrics.SSEEventsTotal.WithLabelValues("itinerary").Inc()
-		log.Printf("SSE sent cached itinerary for %s", id)
-
-		// All data already available - complete immediately
 		fmt.Fprintf(w, "event: complete\ndata: {\"message\":\"All data received\"}\n\n")
 		flusher.Flush()
-		log.Printf("SSE stream complete (from cache) for %s", id)
 		return
 	}
 
-	// Subscribe to all trip events for this request using wildcard
-	// We'll filter by request_id in the message payload
-	subject := "trips.>" // Wildcard to catch images, places, itinerary
-
 	msgChan := make(chan *nats.Msg, 64)
-	sub, err := s.nc.ChanSubscribe(subject, msgChan)
+	sub, err := s.nc.ChanSubscribe("trips.>", msgChan)
 	if err != nil {
-		log.Printf("SSE Subscribe error: %v", err)
-		http.Error(w, "subscription error", http.StatusInternalServerError)
 		return
 	}
 	defer sub.Unsubscribe()
 
-	// Track SSE connection
-	metrics.SSEConnectionsActive.Inc()
-	defer metrics.SSEConnectionsActive.Dec()
-
-	// Create a context that cancels when client disconnects
 	ctx := r.Context()
-
-	// Timeout after 2 minutes (safety net)
 	timeout := time.After(2 * time.Minute)
-
-	log.Printf("SSE stream started for %s", id)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("SSE client disconnected for %s", id)
 			return
-
 		case <-timeout:
 			fmt.Fprintf(w, "event: timeout\ndata: {\"message\":\"Stream timeout\"}\n\n")
 			flusher.Flush()
-			log.Printf("SSE timeout for %s", id)
 			return
-
 		case msg := <-msgChan:
-			// Parse the event to check if it's for our request_id
 			var envelope struct {
 				Type string `json:"type"`
 				Data struct {
@@ -920,55 +1112,33 @@ func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request
 				continue
 			}
 
-			// Skip if not for our request
 			if envelope.Data.RequestID != id {
 				continue
 			}
 
-			// Determine event type and send appropriate SSE event
 			switch msg.Subject {
 			case "trips.images":
 				if !receivedImages {
 					receivedImages = true
-					data, _ := json.Marshal(map[string]interface{}{
-						"type":   "images",
-						"images": envelope.Data.Images,
-					})
+					data, _ := json.Marshal(map[string]interface{}{"type": "images", "images": envelope.Data.Images})
 					fmt.Fprintf(w, "event: images\ndata: %s\n\n", data)
 					flusher.Flush()
-					metrics.SSEEventsTotal.WithLabelValues("images").Inc()
-					log.Printf("SSE sent images for %s", id)
 				}
-
 			case "trips.places":
 				if !receivedPlaces {
 					receivedPlaces = true
-					data, _ := json.Marshal(map[string]interface{}{
-						"type":   "places",
-						"places": envelope.Data.Places,
-					})
+					data, _ := json.Marshal(map[string]interface{}{"type": "places", "places": envelope.Data.Places})
 					fmt.Fprintf(w, "event: places\ndata: %s\n\n", data)
 					flusher.Flush()
-					metrics.SSEEventsTotal.WithLabelValues("places").Inc()
-					log.Printf("SSE sent places for %s", id)
 				}
-
 			case "trips.itinerary":
 				if !receivedItinerary {
 					receivedItinerary = true
-					data, _ := json.Marshal(map[string]interface{}{
-						"type":      "itinerary",
-						"itinerary": envelope.Data.Itinerary,
-					})
+					data, _ := json.Marshal(map[string]interface{}{"type": "itinerary", "itinerary": envelope.Data.Itinerary})
 					fmt.Fprintf(w, "event: itinerary\ndata: %s\n\n", data)
 					flusher.Flush()
-					metrics.SSEEventsTotal.WithLabelValues("itinerary").Inc()
-					log.Printf("SSE sent itinerary for %s", id)
-
-					// Itinerary is the final piece - send complete and close
 					fmt.Fprintf(w, "event: complete\ndata: {\"message\":\"All data received\"}\n\n")
 					flusher.Flush()
-					log.Printf("SSE stream complete for %s", id)
 					return
 				}
 			}
@@ -976,58 +1146,54 @@ func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request
 	}
 }
 
-// consumeItineraries listens for completed AI jobs and updates the database
-func (s *Server) consumeItineraries() {
-	ctx := context.Background()
-	var cons jetstream.Consumer
+// =====================================================
+// BACKGROUND CONSUMERS (Save to DB)
+// =====================================================
 
+func (s *Server) consumeItineraries(ctx context.Context) {
+	var cons jetstream.Consumer
 	for {
 		stream, err := s.js.Stream(ctx, "TRIPS")
 		if err == nil {
 			cons, err = stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-				Durable:       "api-result-writer-v5",
+				Durable:       "api-itinerary-writer-v1",
 				FilterSubject: "trips.itinerary",
 				AckPolicy:     jetstream.AckExplicitPolicy,
-				DeliverPolicy: jetstream.DeliverAllPolicy,
 				AckWait:       30 * time.Second,
-				MaxDeliver:    5,
 			})
 			if err == nil {
 				break
 			}
 		}
-		log.Printf("Waiting for TRIPS stream (itinerary)... (%v)", err)
-		time.Sleep(3 * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
 	}
 
-	log.Println("Background Consumer: Listening for Generated Itineraries...")
-
 	for {
-		msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
-		if err != nil {
-			continue
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
 
+		msgs, _ := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
 		for msg := range msgs.Messages() {
 			var event types.ItineraryGeneratedEvent
 			if err := json.Unmarshal(msg.Data(), &event); err != nil {
-				log.Printf("Invalid event format: %v", err)
 				msg.Ack()
 				continue
 			}
 
 			itineraryBytes, _ := json.Marshal(event.Data.Itinerary)
-
-			// Cast to string for correct Postgres JSON/JSONB handling
-			_, err = s.db.Exec(`
-                UPDATE trips 
-                SET status = 'completed', itinerary = $1, updated_at = NOW()
-                WHERE request_id = $2`,
+			_, err := s.db.Exec(`
+				UPDATE trips SET status = 'completed', itinerary = $1, updated_at = NOW()
+				WHERE request_id = $2`,
 				string(itineraryBytes), event.Data.RequestID,
 			)
-
 			if err != nil {
-				log.Printf("DB Update failed for %s: %v", event.Data.RequestID, err)
 				msg.Nak()
 			} else {
 				log.Printf("Itinerary saved for %s", event.Data.RequestID)
@@ -1037,12 +1203,8 @@ func (s *Server) consumeItineraries() {
 	}
 }
 
-// consumeImages listens for found images and updates the database
-func (s *Server) consumeImages() {
-	ctx := context.Background()
+func (s *Server) consumeImages(ctx context.Context) {
 	var cons jetstream.Consumer
-
-	// Wait loop for Stream existence
 	for {
 		stream, err := s.js.Stream(ctx, "TRIPS")
 		if err == nil {
@@ -1056,44 +1218,38 @@ func (s *Server) consumeImages() {
 				break
 			}
 		}
-		log.Printf("Waiting for TRIPS stream (images)... (%v)", err)
-		time.Sleep(3 * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
 	}
 
-	log.Println("Background Consumer: Listening for Images...")
-
-	// Helper struct for decoding payload
 	type ImagePayload struct {
 		Data struct {
 			RequestID string          `json:"request_id"`
-			Images    json.RawMessage `json:"images"` // Keep as raw JSON to save directly
+			Images    json.RawMessage `json:"images"`
 		} `json:"data"`
 	}
 
 	for {
-		msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
-		if err != nil {
-			continue
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
 
+		msgs, _ := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
 		for msg := range msgs.Messages() {
 			var event ImagePayload
 			if err := json.Unmarshal(msg.Data(), &event); err != nil {
-				log.Printf("Invalid image event format: %v", err)
 				msg.Ack()
 				continue
 			}
 
-			// Update DB with images
-			_, err = s.db.Exec(`
-                UPDATE trips 
-                SET images = $1 
-                WHERE request_id = $2`,
-				string(event.Data.Images), event.Data.RequestID,
-			)
-
+			_, err := s.db.Exec(`UPDATE trips SET images = $1 WHERE request_id = $2`,
+				string(event.Data.Images), event.Data.RequestID)
 			if err != nil {
-				log.Printf("DB Error saving images: %v", err)
 				msg.Nak()
 			} else {
 				log.Printf("Images saved for %s", event.Data.RequestID)
@@ -1103,12 +1259,8 @@ func (s *Server) consumeImages() {
 	}
 }
 
-// consumePlaces listens for found places and updates the database
-func (s *Server) consumePlaces() {
-	ctx := context.Background()
+func (s *Server) consumePlaces(ctx context.Context) {
 	var cons jetstream.Consumer
-
-	// Wait loop for Stream existence
 	for {
 		stream, err := s.js.Stream(ctx, "TRIPS")
 		if err == nil {
@@ -1122,44 +1274,38 @@ func (s *Server) consumePlaces() {
 				break
 			}
 		}
-		log.Printf("Waiting for TRIPS stream (places)... (%v)", err)
-		time.Sleep(3 * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
 	}
 
-	log.Println("Background Consumer: Listening for Places...")
-
-	// Helper struct for decoding payload
 	type PlacesPayload struct {
 		Data struct {
 			RequestID string          `json:"request_id"`
-			Places    json.RawMessage `json:"places"` // Keep as raw JSON to save directly
+			Places    json.RawMessage `json:"places"`
 		} `json:"data"`
 	}
 
 	for {
-		msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
-		if err != nil {
-			continue
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
 
+		msgs, _ := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
 		for msg := range msgs.Messages() {
 			var event PlacesPayload
 			if err := json.Unmarshal(msg.Data(), &event); err != nil {
-				log.Printf("Invalid places event format: %v", err)
 				msg.Ack()
 				continue
 			}
 
-			// Update DB with places
-			_, err = s.db.Exec(`
-                UPDATE trips 
-                SET places = $1 
-                WHERE request_id = $2`,
-				string(event.Data.Places), event.Data.RequestID,
-			)
-
+			_, err := s.db.Exec(`UPDATE trips SET places = $1 WHERE request_id = $2`,
+				string(event.Data.Places), event.Data.RequestID)
 			if err != nil {
-				log.Printf("DB Error saving places: %v", err)
 				msg.Nak()
 			} else {
 				log.Printf("Places saved for %s", event.Data.RequestID)

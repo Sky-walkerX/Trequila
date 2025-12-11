@@ -1,0 +1,61 @@
+{
+  "name": "Trequila",
+  "description": "AI-powered trip planning API with real-time updates",
+  "keywords": ["go", "travel", "ai", "api"],
+  "website": "https://github.com/sky-walkerx/trequila",
+  "repository": "https://github.com/sky-walkerx/trequila",
+  "stack": "heroku-24",
+  "buildpacks": [
+    {
+      "url": "heroku/go"
+    }
+  ],
+  "env": {
+    "NATS_URL": {
+      "description": "NATS JetStream URL (use Synadia NGS or similar)",
+      "required": true
+    },
+    "JWT_SECRET": {
+      "description": "Secret key for JWT signing (use a strong random string)",
+      "generator": "secret"
+    },
+    "GEMINI_API_KEY": {
+      "description": "Google Gemini API key for AI itinerary generation",
+      "required": true
+    },
+    "PEXELS_API_KEY": {
+      "description": "Pexels API key for destination images",
+      "required": true
+    },
+    "GEOAPIFY_API_KEY": {
+      "description": "Geoapify API key for geocoding and places",
+      "required": true
+    },
+    "GOOGLE_CLIENT_ID": {
+      "description": "Google OAuth Client ID (optional)",
+      "required": false
+    },
+    "GOOGLE_CLIENT_SECRET": {
+      "description": "Google OAuth Client Secret (optional)",
+      "required": false
+    },
+    "GOOGLE_REDIRECT_URL": {
+      "description": "Google OAuth Redirect URL",
+      "required": false
+    }
+  },
+  "addons": [
+    {
+      "plan": "heroku-postgresql:essential-0"
+    },
+    {
+      "plan": "heroku-redis:mini"
+    }
+  ],
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  }
+}
