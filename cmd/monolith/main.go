@@ -66,6 +66,11 @@ func main() {
 	}
 	defer db.Close()
 
+	// Configure connection pool for better performance
+	db.SetMaxOpenConns(25)                 // Max open connections
+	db.SetMaxIdleConns(10)                 // Keep 10 idle connections ready
+	db.SetConnMaxLifetime(5 * time.Minute) // Recycle connections every 5 mins
+
 	if err := waitForDB(db); err != nil {
 		log.Fatalf("Could not connect to database: %v", err)
 	}
