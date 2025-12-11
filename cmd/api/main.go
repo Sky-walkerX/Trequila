@@ -65,7 +65,7 @@ func main() {
 		js:   js,
 		nc:   nc,
 		db:   db,
-		auth: auth.NewAuthService(),
+		auth: auth.NewAuthService(db),
 	}
 
 	// 3. Start Background Consumers
@@ -95,9 +95,16 @@ func main() {
 	mux.Handle("/metrics", promhttp.Handler())
 
 	// Auth routes
+	mux.HandleFunc("/auth/register", server.handleRegister)
+	mux.HandleFunc("/auth/login", server.handleLogin)
 	mux.HandleFunc("/auth/google/login", server.handleGoogleLogin)
 	mux.HandleFunc("/auth/google/callback", server.handleGoogleCallback)
 	mux.HandleFunc("/auth/token", server.handleGenerateToken) // For testing/dev
+	
+	// User profile (protected)
+	mux.Handle("/api/me", server.auth.AuthMiddleware(
+		http.HandlerFunc(server.handleGetCurrentUser),
+	))
 
 	// Protected routes (auth required) - wrap with auth middleware
 	mux.Handle("/api/trips", server.auth.AuthMiddleware(
@@ -238,6 +245,7 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGenerateToken is for testing/development - generates a token for a user
+// This creates a real user in the database to avoid FK constraint violations
 func (s *Server) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -255,20 +263,173 @@ func (s *Server) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Generate IDs if not provided
 	if req.UserID == "" {
 		req.UserID = uuid.NewString()
 	}
+	if req.Email == "" {
+		req.Email = fmt.Sprintf("dev-%s@trequila.local", req.UserID[:8])
+	}
+	if req.Name == "" {
+		req.Name = "Dev User"
+	}
 
-	token, err := s.auth.GenerateToken(req.UserID, req.Email, req.Name, "local")
+	// Create or update user in database to satisfy FK constraint
+	_, err := s.db.Exec(`
+		INSERT INTO users (id, email, name, provider)
+		VALUES ($1, $2, $3, 'dev')
+		ON CONFLICT (id) DO UPDATE SET name = $3, updated_at = NOW()`,
+		req.UserID, req.Email, req.Name,
+	)
+	if err != nil {
+		// Try with a unique email if there's a conflict
+		req.Email = fmt.Sprintf("dev-%s@trequila.local", req.UserID)
+		_, err = s.db.Exec(`
+			INSERT INTO users (id, email, name, provider)
+			VALUES ($1, $2, $3, 'dev')
+			ON CONFLICT (id) DO UPDATE SET name = $3, updated_at = NOW()`,
+			req.UserID, req.Email, req.Name,
+		)
+		if err != nil {
+			log.Printf("Failed to create dev user: %v", err)
+			http.Error(w, `{"error":"failed to create dev user"}`, http.StatusInternalServerError)
+			return
+		}
+	}
+
+	token, err := s.auth.GenerateToken(req.UserID, req.Email, req.Name, "dev")
 	if err != nil {
 		http.Error(w, `{"error":"failed to generate token"}`, http.StatusInternalServerError)
 		return
 	}
 
+	log.Printf("Dev token created for user: %s (%s)", req.UserID, req.Email)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"token":   token,
 		"user_id": req.UserID,
+		"email":   req.Email,
+		"name":    req.Name,
+		"warning": "This endpoint is for development only. Do not use in production.",
+	})
+}
+
+// handleRegister handles user registration with email/password
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Name     string `json:"name"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	user, token, err := s.auth.RegisterUser(r.Context(), req.Email, req.Password, req.Name)
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch err {
+		case auth.ErrUserExists:
+			status = http.StatusConflict
+		case auth.ErrInvalidEmail, auth.ErrPasswordRequired:
+			status = http.StatusBadRequest
+		}
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), status)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"token": token,
+		"user": map[string]string{
+			"id":    user.ID,
+			"email": user.Email,
+			"name":  user.Name,
+		},
+	})
+}
+
+// handleLogin handles user login with email/password
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	user, token, err := s.auth.LoginUser(r.Context(), req.Email, req.Password)
+	if err != nil {
+		status := http.StatusUnauthorized
+		switch err {
+		case auth.ErrUserNotFound, auth.ErrInvalidPassword:
+			status = http.StatusUnauthorized
+		case auth.ErrInvalidEmail, auth.ErrPasswordRequired:
+			status = http.StatusBadRequest
+		}
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), status)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"token": token,
+		"user": map[string]string{
+			"id":    user.ID,
+			"email": user.Email,
+			"name":  user.Name,
+		},
+	})
+}
+
+// handleGetCurrentUser returns the current authenticated user's info
+func (s *Server) handleGetCurrentUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := auth.GetUserIDFromContext(r.Context())
+	if userID == "" {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	user, err := s.auth.GetUserByID(r.Context(), userID)
+	if err != nil {
+		if err == auth.ErrUserNotFound {
+			http.Error(w, `{"error":"user not found"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":         user.ID,
+		"email":      user.Email,
+		"name":       user.Name,
+		"provider":   user.Provider,
+		"avatar_url": user.AvatarURL.String,
+		"created_at": user.CreatedAt.Format(time.RFC3339),
 	})
 }
 

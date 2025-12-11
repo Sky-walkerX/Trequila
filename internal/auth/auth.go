@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,15 +12,22 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
 
 var (
-	ErrInvalidToken  = errors.New("invalid token")
-	ErrExpiredToken  = errors.New("token expired")
-	ErrMissingToken  = errors.New("missing authorization token")
-	ErrInvalidClaims = errors.New("invalid token claims")
+	ErrInvalidToken      = errors.New("invalid token")
+	ErrExpiredToken      = errors.New("token expired")
+	ErrMissingToken      = errors.New("missing authorization token")
+	ErrInvalidClaims     = errors.New("invalid token claims")
+	ErrUserExists        = errors.New("user already exists")
+	ErrUserNotFound      = errors.New("user not found")
+	ErrInvalidPassword   = errors.New("invalid password")
+	ErrInvalidEmail      = errors.New("invalid email")
+	ErrPasswordRequired  = errors.New("password required for local accounts")
 )
 
 // Claims represents JWT claims
@@ -31,15 +39,29 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
+// User represents a user in the database
+type User struct {
+	ID           string
+	Email        string
+	Name         string
+	PasswordHash sql.NullString
+	Provider     string
+	ProviderID   sql.NullString
+	AvatarURL    sql.NullString
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
 // AuthService handles authentication
 type AuthService struct {
+	db           *sql.DB
 	jwtSecret    []byte
 	jwtExpiry    time.Duration
 	googleConfig *oauth2.Config
 }
 
 // NewAuthService creates a new auth service
-func NewAuthService() *AuthService {
+func NewAuthService(db *sql.DB) *AuthService {
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		jwtSecret = "your-super-secret-key-change-in-production" // Default for dev
@@ -61,6 +83,7 @@ func NewAuthService() *AuthService {
 	}
 
 	return &AuthService{
+		db:           db,
 		jwtSecret:    []byte(jwtSecret),
 		jwtExpiry:    24 * time.Hour, // Token valid for 24 hours
 		googleConfig: googleConfig,
@@ -205,7 +228,7 @@ func (a *AuthService) HandleGoogleCallback(ctx context.Context, code string) (*G
 		return nil, "", fmt.Errorf("code exchange failed: %w", err)
 	}
 
-	// Get user info
+	// Get user info from Google
 	client := a.googleConfig.Client(ctx, token)
 	resp, err := client.Get("https://www.googleapis.com/oauth2/v2/userinfo")
 	if err != nil {
@@ -213,9 +236,15 @@ func (a *AuthService) HandleGoogleCallback(ctx context.Context, code string) (*G
 	}
 	defer resp.Body.Close()
 
-	var user GoogleUser
-	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+	var googleUser GoogleUser
+	if err := json.NewDecoder(resp.Body).Decode(&googleUser); err != nil {
 		return nil, "", fmt.Errorf("failed to decode user info: %w", err)
+	}
+
+	// Find or create user in database
+	user, err := a.FindOrCreateOAuthUser(ctx, googleUser.Email, googleUser.Name, "google", googleUser.ID, googleUser.Picture)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create user: %w", err)
 	}
 
 	// Generate JWT for the user
@@ -224,5 +253,188 @@ func (a *AuthService) HandleGoogleCallback(ctx context.Context, code string) (*G
 		return nil, "", fmt.Errorf("failed to generate token: %w", err)
 	}
 
-	return &user, jwtToken, nil
+	return &googleUser, jwtToken, nil
+}
+
+// ===== User Management =====
+
+// RegisterUser creates a new user with email and password
+func (a *AuthService) RegisterUser(ctx context.Context, email, password, name string) (*User, string, error) {
+	if email == "" || !strings.Contains(email, "@") {
+		return nil, "", ErrInvalidEmail
+	}
+	if password == "" {
+		return nil, "", ErrPasswordRequired
+	}
+	if len(password) < 8 {
+		return nil, "", errors.New("password must be at least 8 characters")
+	}
+
+	// Check if user already exists
+	var existingID string
+	err := a.db.QueryRowContext(ctx, `SELECT id FROM users WHERE email = $1`, email).Scan(&existingID)
+	if err == nil {
+		return nil, "", ErrUserExists
+	} else if err != sql.ErrNoRows {
+		return nil, "", fmt.Errorf("database error: %w", err)
+	}
+
+	// Hash password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	// Create user
+	userID := uuid.NewString()
+	_, err = a.db.ExecContext(ctx, `
+		INSERT INTO users (id, email, name, password_hash, provider)
+		VALUES ($1, $2, $3, $4, 'local')`,
+		userID, email, name, string(hashedPassword),
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create user: %w", err)
+	}
+
+	user := &User{
+		ID:       userID,
+		Email:    email,
+		Name:     name,
+		Provider: "local",
+	}
+
+	// Generate token
+	token, err := a.GenerateToken(userID, email, name, "local")
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	return user, token, nil
+}
+
+// LoginUser authenticates a user with email and password
+func (a *AuthService) LoginUser(ctx context.Context, email, password string) (*User, string, error) {
+	if email == "" {
+		return nil, "", ErrInvalidEmail
+	}
+	if password == "" {
+		return nil, "", ErrPasswordRequired
+	}
+
+	var user User
+	err := a.db.QueryRowContext(ctx, `
+		SELECT id, email, name, password_hash, provider, provider_id, avatar_url, created_at, updated_at
+		FROM users WHERE email = $1`,
+		email,
+	).Scan(&user.ID, &user.Email, &user.Name, &user.PasswordHash, &user.Provider, 
+		&user.ProviderID, &user.AvatarURL, &user.CreatedAt, &user.UpdatedAt)
+
+	if err == sql.ErrNoRows {
+		return nil, "", ErrUserNotFound
+	} else if err != nil {
+		return nil, "", fmt.Errorf("database error: %w", err)
+	}
+
+	// Check if user has a password (local account)
+	if !user.PasswordHash.Valid || user.PasswordHash.String == "" {
+		return nil, "", errors.New("this account uses OAuth login, please use Google sign-in")
+	}
+
+	// Verify password
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(password)); err != nil {
+		return nil, "", ErrInvalidPassword
+	}
+
+	// Generate token
+	token, err := a.GenerateToken(user.ID, user.Email, user.Name, user.Provider)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	return &user, token, nil
+}
+
+// FindOrCreateOAuthUser finds an existing OAuth user or creates a new one
+func (a *AuthService) FindOrCreateOAuthUser(ctx context.Context, email, name, provider, providerID, avatarURL string) (*User, error) {
+	var user User
+
+	// Try to find existing user by provider + provider_id
+	err := a.db.QueryRowContext(ctx, `
+		SELECT id, email, name, password_hash, provider, provider_id, avatar_url, created_at, updated_at
+		FROM users WHERE provider = $1 AND provider_id = $2`,
+		provider, providerID,
+	).Scan(&user.ID, &user.Email, &user.Name, &user.PasswordHash, &user.Provider,
+		&user.ProviderID, &user.AvatarURL, &user.CreatedAt, &user.UpdatedAt)
+
+	if err == nil {
+		// User exists, update their info
+		_, _ = a.db.ExecContext(ctx, `
+			UPDATE users SET name = $1, avatar_url = $2, updated_at = NOW() WHERE id = $3`,
+			name, avatarURL, user.ID,
+		)
+		user.Name = name
+		return &user, nil
+	}
+
+	if err != sql.ErrNoRows {
+		return nil, fmt.Errorf("database error: %w", err)
+	}
+
+	// Check if email exists with different provider
+	err = a.db.QueryRowContext(ctx, `SELECT id FROM users WHERE email = $1`, email).Scan(&user.ID)
+	if err == nil {
+		// Email exists - link this OAuth to existing account
+		_, err = a.db.ExecContext(ctx, `
+			UPDATE users SET provider = $1, provider_id = $2, avatar_url = $3, updated_at = NOW() WHERE email = $4`,
+			provider, providerID, avatarURL, email,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to link account: %w", err)
+		}
+		// Fetch updated user
+		_ = a.db.QueryRowContext(ctx, `
+			SELECT id, email, name, password_hash, provider, provider_id, avatar_url, created_at, updated_at
+			FROM users WHERE email = $1`,
+			email,
+		).Scan(&user.ID, &user.Email, &user.Name, &user.PasswordHash, &user.Provider,
+			&user.ProviderID, &user.AvatarURL, &user.CreatedAt, &user.UpdatedAt)
+		return &user, nil
+	}
+
+	// Create new user
+	userID := uuid.NewString()
+	_, err = a.db.ExecContext(ctx, `
+		INSERT INTO users (id, email, name, provider, provider_id, avatar_url)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		userID, email, name, provider, providerID, avatarURL,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	return &User{
+		ID:       userID,
+		Email:    email,
+		Name:     name,
+		Provider: provider,
+	}, nil
+}
+
+// GetUserByID retrieves a user by ID
+func (a *AuthService) GetUserByID(ctx context.Context, userID string) (*User, error) {
+	var user User
+	err := a.db.QueryRowContext(ctx, `
+		SELECT id, email, name, password_hash, provider, provider_id, avatar_url, created_at, updated_at
+		FROM users WHERE id = $1`,
+		userID,
+	).Scan(&user.ID, &user.Email, &user.Name, &user.PasswordHash, &user.Provider,
+		&user.ProviderID, &user.AvatarURL, &user.CreatedAt, &user.UpdatedAt)
+
+	if err == sql.ErrNoRows {
+		return nil, ErrUserNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("database error: %w", err)
+	}
+
+	return &user, nil
 }
