@@ -62,3 +62,4 @@ debug
 local.yml
 local.yaml
 config.local.*
+.env
