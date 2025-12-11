@@ -34,12 +34,19 @@ type Service struct {
 	redis  *redis.Client
 }
 
-func NewService(apiKey, redisAddr string) *Service {
+func NewService(apiKey, redisURL string) *Service {
 	var rdb *redis.Client
-	if redisAddr != "" {
-		rdb = redis.NewClient(&redis.Options{
-			Addr: redisAddr,
-		})
+
+	if redisURL != "" {
+		// Parse Redis URL (supports rediss:// for Heroku/TLS)
+		opt, err := redis.ParseURL(redisURL)
+		if err != nil {
+			log.Printf("Failed to parse Redis URL, using as address: %v", err)
+			// Fallback: treat as simple address (for local dev)
+			rdb = redis.NewClient(&redis.Options{Addr: redisURL})
+		} else {
+			rdb = redis.NewClient(opt)
+		}
 	}
 
 	return &Service{

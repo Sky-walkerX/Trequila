@@ -25,10 +25,20 @@ type Service struct {
 	window    time.Duration // Time window
 }
 
-func NewService(redisAddr, apiKey string) *Service {
-	rdb := redis.NewClient(&redis.Options{
-		Addr: redisAddr,
-	})
+func NewService(redisURL, apiKey string) *Service {
+	var rdb *redis.Client
+
+	if redisURL != "" {
+		// Parse Redis URL (supports rediss:// for Heroku/TLS)
+		opt, err := redis.ParseURL(redisURL)
+		if err != nil {
+			fmt.Printf("Failed to parse Redis URL, using as address: %v\n", err)
+			// Fallback: treat as simple address (for local dev)
+			rdb = redis.NewClient(&redis.Options{Addr: redisURL})
+		} else {
+			rdb = redis.NewClient(opt)
+		}
+	}
 
 	return &Service{
 		redis:     rdb,
@@ -41,20 +51,24 @@ func NewService(redisAddr, apiKey string) *Service {
 func (s *Service) GetImages(ctx context.Context, query string) ([]Image, error) {
 	cacheKey := fmt.Sprintf("images:%s", query)
 
-	// 1. Check Cache (Redis)
-	val, err := s.redis.Get(ctx, cacheKey).Result()
-	if err == nil {
-		var images []Image
-		if json.Unmarshal([]byte(val), &images) == nil {
-			fmt.Println("Cache Hit for", query)
-			metrics.CacheHitsTotal.WithLabelValues("images").Inc()
-			return images, nil
+	// 1. Check Cache (Redis) - skip if redis not configured
+	if s.redis != nil {
+		val, err := s.redis.Get(ctx, cacheKey).Result()
+		if err == nil {
+			var images []Image
+			if json.Unmarshal([]byte(val), &images) == nil {
+				fmt.Println("Cache Hit for", query)
+				metrics.CacheHitsTotal.WithLabelValues("images").Inc()
+				return images, nil
+			}
 		}
 	}
 
-	// 2. Check Rate Limit (Redis)
-	if err := s.checkRateLimit(ctx); err != nil {
-		return nil, err
+	// 2. Check Rate Limit (Redis) - skip if redis not configured
+	if s.redis != nil {
+		if err := s.checkRateLimit(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	// 3. Call External API (Pexels)
@@ -65,9 +79,11 @@ func (s *Service) GetImages(ctx context.Context, query string) ([]Image, error) 
 		return nil, err
 	}
 
-	// 4. Save to Cache (7 Day TTL)
-	data, _ := json.Marshal(images)
-	s.redis.Set(ctx, cacheKey, data, 7*24*time.Hour)
+	// 4. Save to Cache (7 Day TTL) - skip if redis not configured
+	if s.redis != nil {
+		data, _ := json.Marshal(images)
+		s.redis.Set(ctx, cacheKey, data, 7*24*time.Hour)
+	}
 
 	return images, nil
 }
