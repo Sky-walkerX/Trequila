@@ -3,9 +3,11 @@ package images
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -36,6 +38,10 @@ func NewService(redisURL, apiKey string) *Service {
 			// Fallback: treat as simple address (for local dev)
 			rdb = redis.NewClient(&redis.Options{Addr: redisURL})
 		} else {
+			// Heroku Redis requires InsecureSkipVerify due to certificate mismatch
+			if strings.HasPrefix(redisURL, "rediss://") {
+				opt.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+			}
 			rdb = redis.NewClient(opt)
 		}
 	}
