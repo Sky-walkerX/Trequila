@@ -31,6 +31,7 @@ import (
 	"github.com/sky-walkerx/trequila/internal/middleware"
 	natshelper "github.com/sky-walkerx/trequila/internal/nats"
 	"github.com/sky-walkerx/trequila/internal/planner"
+	"github.com/sky-walkerx/trequila/internal/vibes"
 	"github.com/sky-walkerx/trequila/internal/types"
 	"golang.org/x/time/rate"
 )
@@ -104,6 +105,10 @@ func main() {
 	go startPlacesWorker(ctx, js, config.GeoapifyAPIKey, config.RedisAddr)
 	log.Println("Started Places worker")
 
+	// Vibes worker (Analyze Safety/Weather/Crowds)
+	go startVibesWorker(ctx, config.NatsURL, config.GeminiVibesKey)
+    log.Println("Started Vibes worker")
+
 	// 6. Setup HTTP server
 	handler := server.setupRoutes()
 
@@ -155,6 +160,7 @@ type Config struct {
 	PexelsAPIKey   string
 	GeoapifyAPIKey string
 	JWTSecret      string
+	GeminiVibesKey string
 }
 
 func loadConfig() Config {
@@ -169,6 +175,7 @@ func loadConfig() Config {
 		PexelsAPIKey:   os.Getenv("PEXELS_API_KEY"),
 		GeoapifyAPIKey: os.Getenv("GEOAPIFY_API_KEY"),
 		JWTSecret:      getEnv("JWT_SECRET", "dev-secret-change-in-production"),
+		GeminiVibesKey: os.Getenv("GEMINI_VIBES_KEY"),
 	}
 
 	// Validate required keys
@@ -180,6 +187,9 @@ func loadConfig() Config {
 	}
 	if config.GeoapifyAPIKey == "" {
 		log.Println("WARNING: GEOAPIFY_API_KEY not set - Places will fail")
+	}
+	if config.GeminiVibesKey == "" {
+		log.Println("WARNING: GEMINI_VIBES_KEY not set - Vibes will fail")
 	}
 
 	return config
@@ -415,6 +425,25 @@ func startPlacesWorker(ctx context.Context, js jetstream.JetStream, apiKey, redi
 			log.Printf("Places: Found places for %s", reqID)
 		}
 	}
+}
+
+// =====================================================
+// VIBES WORKER
+// ====================================================
+
+func startVibesWorker(ctx context.Context, natsURL, apiKey string) {
+    if apiKey == "" {
+        log.Println("Vibes: Skipping - no API key")
+        return
+    }
+
+    // Launch Vibes worker in a goroutine
+    // We pass ctx to allow it to be aware of shutdowns, although
+    // StartWorker currently doesn't accept ctx, we run it async.
+    go func() {
+        log.Println("Vibes: Starting worker...")
+        vibes.StartWorker(natsURL, apiKey)
+    }()
 }
 
 // =====================================================

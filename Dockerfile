@@ -1,6 +1,6 @@
 # Trequila API - Single container build
 
-FROM golang:1.23-alpine AS builder
+FROM golang:1.24.0-alpine AS builder
 
 WORKDIR /app
 
