@@ -9,7 +9,6 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// IncomingPlace matches the JSON structure from your Places Worker
 type IncomingPlace struct {
 	Name     string  `json:"name"`
 	Category string  `json:"category"`
@@ -17,20 +16,17 @@ type IncomingPlace struct {
 	Lon      float64 `json:"lon"`
 }
 
+// FIX 1: Update struct to match the "Map" structure sent by Places worker
 type PlacesEvent struct {
-	RequestID string          `json:"request_id"`
-	Places    []IncomingPlace `json:"places"`
+	RequestID string                      `json:"request_id"`
+	Places    map[string][]IncomingPlace  `json:"places"` // Changed from [] to map[string][]
 }
 
-// StartWorker now accepts the existing JetStream connection (js)
 func StartWorker(js jetstream.JetStream, apiKey string) {
 	ctx := context.Background()
 
-	// 1. Setup Consumer (Listen for Places)
 	var stream jetstream.Stream
 	var err error
-	
-	// Retry logic to find stream (it might take a second for other workers to start)
 	for i := 0; i < 10; i++ {
 		stream, err = js.Stream(ctx, "TRIPS")
 		if err == nil { break }
@@ -44,7 +40,7 @@ func StartWorker(js jetstream.JetStream, apiKey string) {
 
 	cons, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Durable:       "vibes-worker-monolith",
-		FilterSubject: "trips.places", // Listen to the Places worker output
+		FilterSubject: "trips.places", 
 		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	if err != nil {
@@ -54,7 +50,6 @@ func StartWorker(js jetstream.JetStream, apiKey string) {
 
 	log.Println("✨ Vibes Worker (AI Powered) Started...")
 
-	// 2. The Infinite Loop
 	for {
 		msgs, err := cons.Fetch(1)
 		if err != nil {
@@ -70,34 +65,42 @@ func StartWorker(js jetstream.JetStream, apiKey string) {
 				continue
 			}
 
-			log.Printf("Vibes: Analyzing %d places for %s...", len(event.Places), event.RequestID)
+            // FIX 2: Flatten the map. Count total places first.
+            totalPlaces := 0
+            for _, list := range event.Places {
+                totalPlaces += len(list)
+            }
+			log.Printf("Vibes: Analyzing %d places for %s...", totalPlaces, event.RequestID)
 
-			for _, p := range event.Places {
-				// A. Weather Check (Free Open-Meteo)
-				weatherSummary, _ := GetWeather(p.Lat, p.Lon)
+			// FIX 3: Iterate through categories (hotels, restaurants, etc.)
+			for _, placeList := range event.Places {
+                for _, p := range placeList {
+                    
+                    // A. Weather Check
+                    weatherSummary, _ := GetWeather(p.Lat, p.Lon)
 
-				// B. Super Analysis (Gemini AI)
-				insights := AnalyzePlaceWithAI(apiKey, p.Name, p.Category)
+                    // B. Super Analysis
+                    insights := AnalyzePlaceWithAI(apiKey, p.Name, p.Category)
 
-				// C. Publish Result
-				payload := map[string]interface{}{
-					"request_id":   event.RequestID,
-					"place_name":   p.Name,
-					"weather":      weatherSummary,
-					"safety_score": insights.SafetyScore,
-					"safety_tip":   insights.SafetyTip,
-					"crowds":       insights.CrowdLevel,
-					"best_time":    insights.BestTime,
-					"duration":     insights.Duration,
-					"photo_tip":    insights.PhotoTip,
-				}
+                    // C. Publish Result
+                    payload := map[string]interface{}{
+                        "request_id":   event.RequestID,
+                        "place_name":   p.Name,
+                        "weather":      weatherSummary,
+                        "safety_score": insights.SafetyScore,
+                        "safety_tip":   insights.SafetyTip,
+                        "crowds":       insights.CrowdLevel,
+                        "best_time":    insights.BestTime,
+                        "duration":     insights.Duration,
+                        "photo_tip":    insights.PhotoTip,
+                    }
 
-				data, _ := json.Marshal(payload)
-				// Use the passed 'js' connection to publish
-				js.Publish(ctx, "trips.vibes.update", data)
-				
-				log.Printf("✅ Vibe check sent for: %s", p.Name)
-			}
+                    data, _ := json.Marshal(payload)
+                    js.Publish(ctx, "trips.vibes.update", data)
+                    
+                    log.Printf("✅ Vibe check sent for: %s", p.Name)
+                }
+            }
 			msg.Ack()
 		}
 	}
