@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
-	"github.com/sky-walkerx/trequila/internal/nats"
 )
 
 // IncomingPlace matches the JSON structure from your Places Worker
@@ -23,18 +22,15 @@ type PlacesEvent struct {
 	Places    []IncomingPlace `json:"places"`
 }
 
-// StartWorker is called by the Monolith to start this background job
-func StartWorker(natsURL, apiKey string) {
-	// 1. Connect to NATS
-	// Note: We use the helper from internal/nats to ensure consistent connection logic
-	// If you passed the raw URL, we connect here.
-	js, _ := nats.ConnectJetStream(natsURL, "", "") 
+// StartWorker now accepts the existing JetStream connection (js)
+func StartWorker(js jetstream.JetStream, apiKey string) {
 	ctx := context.Background()
 
-	// 2. Setup Consumer (Listen for Places)
-	// We wait until the TRIPS stream exists (created by other workers)
+	// 1. Setup Consumer (Listen for Places)
 	var stream jetstream.Stream
 	var err error
+	
+	// Retry logic to find stream (it might take a second for other workers to start)
 	for i := 0; i < 10; i++ {
 		stream, err = js.Stream(ctx, "TRIPS")
 		if err == nil { break }
@@ -58,11 +54,10 @@ func StartWorker(natsURL, apiKey string) {
 
 	log.Println("✨ Vibes Worker (AI Powered) Started...")
 
-	// 3. The Infinite Loop
+	// 2. The Infinite Loop
 	for {
 		msgs, err := cons.Fetch(1)
 		if err != nil {
-			// No messages available, sleep briefly
 			time.Sleep(1 * time.Second)
 			continue
 		}
@@ -77,7 +72,6 @@ func StartWorker(natsURL, apiKey string) {
 
 			log.Printf("Vibes: Analyzing %d places for %s...", len(event.Places), event.RequestID)
 
-			// Process each place found
 			for _, p := range event.Places {
 				// A. Weather Check (Free Open-Meteo)
 				weatherSummary, _ := GetWeather(p.Lat, p.Lon)
@@ -99,7 +93,7 @@ func StartWorker(natsURL, apiKey string) {
 				}
 
 				data, _ := json.Marshal(payload)
-				// Publish to "trips.vibes.update" (Frontend listens to this via SSE)
+				// Use the passed 'js' connection to publish
 				js.Publish(ctx, "trips.vibes.update", data)
 				
 				log.Printf("✅ Vibe check sent for: %s", p.Name)

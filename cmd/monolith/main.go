@@ -106,7 +106,7 @@ func main() {
 	log.Println("Started Places worker")
 
 	// Vibes worker (Analyze Safety/Weather/Crowds)
-	go startVibesWorker(ctx, config.NatsURL, config.GeminiVibesKey)
+	go startVibesWorker(ctx, js, config.GeminiVibesKey)
     log.Println("Started Vibes worker")
 
 	// 6. Setup HTTP server
@@ -431,19 +431,12 @@ func startPlacesWorker(ctx context.Context, js jetstream.JetStream, apiKey, redi
 // VIBES WORKER
 // ====================================================
 
-func startVibesWorker(ctx context.Context, natsURL, apiKey string) {
-    if apiKey == "" {
-        log.Println("Vibes: Skipping - no API key")
-        return
-    }
-
-    // Launch Vibes worker in a goroutine
-    // We pass ctx to allow it to be aware of shutdowns, although
-    // StartWorker currently doesn't accept ctx, we run it async.
-    go func() {
-        log.Println("Vibes: Starting worker...")
-        vibes.StartWorker(natsURL, apiKey)
-    }()
+func startVibesWorker(ctx context.Context, js jetstream.JetStream, apiKey string) {
+	if apiKey == "" { return }
+	
+	go func() {
+		vibes.StartWorker(js, apiKey)
+	}()
 }
 
 // =====================================================
