@@ -65,61 +65,79 @@ func NewService(apiKey, redisURL string) *Service {
 
 // 1. Geocode: Convert "Paris" to Lat/Lon (with Redis caching)
 func (s *Service) GetCoordinates(city string) (float64, float64, error) {
-	ctx := context.Background()
-	cacheKey := fmt.Sprintf("geo:coords:%s", city)
+    ctx := context.Background()
+    cacheKey := fmt.Sprintf("geo:coords:%s", city)
 
-	// Check Redis cache first
-	if s.redis != nil {
-		val, err := s.redis.Get(ctx, cacheKey).Result()
-		if err == nil {
-			var coords Coordinates
-			if json.Unmarshal([]byte(val), &coords) == nil {
-				log.Printf("Cache HIT for coordinates: %s", city)
-				metrics.CacheHitsTotal.WithLabelValues("geo_coords").Inc()
-				return coords.Lat, coords.Lon, nil
-			}
-		}
-	}
+    // Check Redis cache first
+    if s.redis != nil {
+        val, err := s.redis.Get(ctx, cacheKey).Result()
+        if err == nil {
+            var coords Coordinates
+            if json.Unmarshal([]byte(val), &coords) == nil {
+                // --- NEW: CHECK FOR NEGATIVE CACHE (Sentinel value) ---
+                // If we cached 0,0, it means we already know this city doesn't exist.
+                if coords.Lat == 0 && coords.Lon == 0 {
+                    log.Printf("Cache HIT (Negative): %s is known to be invalid", city)
+                    // Return error immediately to stop API calls
+                    return 0, 0, fmt.Errorf("location not found (cached)")
+                }
+                // ------------------------------------------------------
 
-	log.Printf("Cache MISS for coordinates: %s - fetching from API", city)
-	metrics.CacheMissesTotal.WithLabelValues("geo_coords").Inc()
+                log.Printf("Cache HIT for coordinates: %s", city)
+                metrics.CacheHitsTotal.WithLabelValues("geo_coords").Inc()
+                return coords.Lat, coords.Lon, nil
+            }
+        }
+    }
 
-	safeCity := url.QueryEscape(city)
-	apiURL := fmt.Sprintf("https://api.geoapify.com/v1/geocode/search?text=%s&apiKey=%s&limit=1", safeCity, s.apiKey)
+    log.Printf("Cache MISS for coordinates: %s - fetching from API", city)
+    metrics.CacheMissesTotal.WithLabelValues("geo_coords").Inc()
 
-	resp, err := s.client.Get(apiURL)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer resp.Body.Close()
+    safeCity := url.QueryEscape(city)
+    apiURL := fmt.Sprintf("https://api.geoapify.com/v1/geocode/search?text=%s&apiKey=%s&limit=1", safeCity, s.apiKey)
 
-	var result struct {
-		Features []struct {
-			Properties struct {
-				Lat float64 `json:"lat"`
-				Lon float64 `json:"lon"`
-			} `json:"properties"`
-		} `json:"features"`
-	}
+    resp, err := s.client.Get(apiURL)
+    if err != nil {
+        return 0, 0, err
+    }
+    defer resp.Body.Close()
 
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, 0, err
-	}
+    var result struct {
+        Features []struct {
+            Properties struct {
+                Lat float64 `json:"lat"`
+                Lon float64 `json:"lon"`
+            } `json:"properties"`
+        } `json:"features"`
+    }
 
-	if len(result.Features) == 0 {
-		return 0, 0, fmt.Errorf("location not found")
-	}
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return 0, 0, err
+    }
 
-	lat := result.Features[0].Properties.Lat
-	lon := result.Features[0].Properties.Lon
+    // --- NEW: IF LOCATION NOT FOUND, CACHE THE FAILURE ---
+    if len(result.Features) == 0 {
+        if s.redis != nil {
+            log.Printf("Caching 'Not Found' for: %s", city)
+            // We save 0,0 to indicate "Not Found".
+            // Expires in 1 hour so we don't retry bad inputs constantly.
+            data, _ := json.Marshal(Coordinates{Lat: 0, Lon: 0})
+            s.redis.Set(ctx, cacheKey, data, 1*time.Hour)
+        }
+        return 0, 0, fmt.Errorf("location not found")
+    }
+    // -----------------------------------------------------
 
-	// Cache for 7 days (coordinates rarely change)
-	if s.redis != nil {
-		data, _ := json.Marshal(Coordinates{Lat: lat, Lon: lon})
-		s.redis.Set(ctx, cacheKey, data, 7*24*time.Hour)
-	}
+    lat := result.Features[0].Properties.Lat
+    lon := result.Features[0].Properties.Lon
 
-	return lat, lon, nil
+    // Cache success for 7 days (coordinates rarely change)
+    if s.redis != nil {
+        data, _ := json.Marshal(Coordinates{Lat: lat, Lon: lon})
+        s.redis.Set(ctx, cacheKey, data, 7*24*time.Hour)
+    }
+
+    return lat, lon, nil
 }
 
 // 2. SearchPlaces: Find hotels/restaurants near coordinates (with Redis caching)

@@ -398,11 +398,24 @@ func startPlacesWorker(ctx context.Context, js jetstream.JetStream, apiKey, redi
 			log.Printf("Places: Finding places for %s (%s)", reqID, dest)
 
 			lat, lon, err := geoSvc.GetCoordinates(dest)
-			if err != nil {
-				log.Printf("Places: Geocode failed: %v", err)
-				msg.Nak()
-				continue
-			}
+				if err != nil {
+					// Check if it's a "Not Found" error (Terminal Error)
+					// This string matches the error we created in the Service
+					if strings.Contains(err.Error(), "not found") {
+						log.Printf("Places: Invalid location '%s', dropping request.", dest)
+						msg.Ack() // ✅ ACK IT: Remove bad data from the queue
+						
+						// Optional: Publish a "TripFailed" event here so the UI knows it failed
+						// js.Publish(ctx, "trips.failed", ...)
+						
+						continue
+					}
+
+					// If it's a different error (e.g., Network / Redis down), retry later
+					log.Printf("Places: Transient error for '%s': %v", dest, err)
+					msg.Nak() // ⚠️ Only Nak for temporary failures
+					continue
+				}
 
 			hotels, _ := geoSvc.SearchPlaces(lat, lon, "accommodation.hotel", 5)
 			restaurants, _ := geoSvc.SearchPlaces(lat, lon, "catering.restaurant", 5)
