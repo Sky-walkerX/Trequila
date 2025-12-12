@@ -91,6 +91,7 @@ func main() {
 	go server.consumeItineraries(ctx)
 	go server.consumeImages(ctx)
 	go server.consumePlaces(ctx)
+	go server.consumeVibes(ctx)
 	log.Println("Started API consumers")
 
 	// Planner worker (AI itinerary generation)
@@ -1067,127 +1068,158 @@ func (s *Server) handleStreamTripAuth(w http.ResponseWriter, r *http.Request, us
 }
 
 func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request, id string) {
-	var status string
-	var imagesJSON, placesJSON, itineraryJSON []byte
-	err := s.db.QueryRow(`
-		SELECT status, images, places, itinerary FROM trips WHERE request_id = $1`, id,
-	).Scan(&status, &imagesJSON, &placesJSON, &itineraryJSON)
+    var status string
+    // Added vibesJSON
+    var imagesJSON, placesJSON, itineraryJSON, vibesJSON []byte 
+    
+    // 1. UPDATE QUERY to include 'vibes'
+    err := s.db.QueryRow(`
+        SELECT status, images, places, itinerary, vibes 
+        FROM trips WHERE request_id = $1`, id,
+    ).Scan(&status, &imagesJSON, &placesJSON, &itineraryJSON, &vibesJSON)
 
-	if err == sql.ErrNoRows {
-		http.Error(w, "trip not found", http.StatusNotFound)
-		return
-	} else if err != nil {
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
-	}
+    if err == sql.ErrNoRows {
+        http.Error(w, "trip not found", http.StatusNotFound)
+        return
+    } else if err != nil {
+        http.Error(w, "server error", http.StatusInternalServerError)
+        return
+    }
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+    // ... headers setup (Content-Type, etc.) ...
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("Connection", "keep-alive")
+    w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
-		return
-	}
+    flusher, ok := w.(http.Flusher)
+    if !ok {
+        http.Error(w, "streaming not supported", http.StatusInternalServerError)
+        return
+    }
 
-	fmt.Fprintf(w, "event: connected\ndata: {\"request_id\":\"%s\",\"message\":\"Stream connected\"}\n\n", id)
-	flusher.Flush()
+    fmt.Fprintf(w, "event: connected\ndata: {\"request_id\":\"%s\",\"message\":\"Stream connected\"}\n\n", id)
+    flusher.Flush()
 
-	metrics.SSEConnectionsActive.Inc()
-	defer metrics.SSEConnectionsActive.Dec()
+    metrics.SSEConnectionsActive.Inc()
+    defer metrics.SSEConnectionsActive.Dec()
 
-	receivedImages := len(imagesJSON) > 0
-	receivedPlaces := len(placesJSON) > 0
-	receivedItinerary := len(itineraryJSON) > 0
+    // 2. CHECK FLAGS
+    receivedImages := len(imagesJSON) > 0
+    receivedPlaces := len(placesJSON) > 0
+    receivedItinerary := len(itineraryJSON) > 0
+    receivedVibes := len(vibesJSON) > 0 // New flag
 
-	if receivedImages {
-		data, _ := json.Marshal(map[string]interface{}{"type": "images", "images": json.RawMessage(imagesJSON)})
-		fmt.Fprintf(w, "event: images\ndata: %s\n\n", data)
-		flusher.Flush()
-	}
+    // 3. SEND DB DATA
+    if receivedImages {
+        data, _ := json.Marshal(map[string]interface{}{"type": "images", "images": json.RawMessage(imagesJSON)})
+        fmt.Fprintf(w, "event: images\ndata: %s\n\n", data)
+        flusher.Flush()
+    }
+    if receivedPlaces {
+        data, _ := json.Marshal(map[string]interface{}{"type": "places", "places": json.RawMessage(placesJSON)})
+        fmt.Fprintf(w, "event: places\ndata: %s\n\n", data)
+        flusher.Flush()
+    }
+    // New Vibes Block
+    if receivedVibes {
+        data, _ := json.Marshal(map[string]interface{}{"type": "vibes", "vibes": json.RawMessage(vibesJSON)})
+        fmt.Fprintf(w, "event: vibes\ndata: %s\n\n", data)
+        flusher.Flush()
+    }
+    if receivedItinerary {
+        data, _ := json.Marshal(map[string]interface{}{"type": "itinerary", "itinerary": json.RawMessage(itineraryJSON)})
+        fmt.Fprintf(w, "event: itinerary\ndata: %s\n\n", data)
+        flusher.Flush()
+    }
 
-	if receivedPlaces {
-		data, _ := json.Marshal(map[string]interface{}{"type": "places", "places": json.RawMessage(placesJSON)})
-		fmt.Fprintf(w, "event: places\ndata: %s\n\n", data)
-		flusher.Flush()
-	}
+    // 4. CHECK COMPLETION (Both must be present to stop immediately)
+    if receivedItinerary && receivedVibes {
+        fmt.Fprintf(w, "event: complete\ndata: {\"message\":\"All data received\"}\n\n")
+        flusher.Flush()
+        return
+    }
 
-	if receivedItinerary {
-		data, _ := json.Marshal(map[string]interface{}{"type": "itinerary", "itinerary": json.RawMessage(itineraryJSON)})
-		fmt.Fprintf(w, "event: itinerary\ndata: %s\n\n", data)
-		flusher.Flush()
-		fmt.Fprintf(w, "event: complete\ndata: {\"message\":\"All data received\"}\n\n")
-		flusher.Flush()
-		return
-	}
+    // ... Subscription setup ...
+    msgChan := make(chan *nats.Msg, 64)
+    // Optimization: Subscribe to specific ID to reduce CPU load
+    sub, err := s.nc.ChanSubscribe("trips.>", msgChan) 
+    if err != nil { return }
+    defer sub.Unsubscribe()
 
-	msgChan := make(chan *nats.Msg, 64)
-	sub, err := s.nc.ChanSubscribe("trips.>", msgChan)
-	if err != nil {
-		return
-	}
-	defer sub.Unsubscribe()
+    ctx := r.Context()
+    timeout := time.After(2 * time.Minute)
 
-	ctx := r.Context()
-	timeout := time.After(2 * time.Minute)
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-timeout:
+            fmt.Fprintf(w, "event: timeout\ndata: {\"message\":\"Stream timeout\"}\n\n")
+            flusher.Flush()
+            return
+        case msg := <-msgChan:
+            var envelope struct {
+                Type string `json:"type"`
+                Data struct {
+                    RequestID string          `json:"request_id"`
+                    Images    json.RawMessage `json:"images,omitempty"`
+                    Places    json.RawMessage `json:"places,omitempty"`
+                    Itinerary json.RawMessage `json:"itinerary,omitempty"`
+                    Vibes     json.RawMessage `json:"vibes,omitempty"` // Add Vibes
+                } `json:"data"`
+            }
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timeout:
-			fmt.Fprintf(w, "event: timeout\ndata: {\"message\":\"Stream timeout\"}\n\n")
-			flusher.Flush()
-			return
-		case msg := <-msgChan:
-			var envelope struct {
-				Type string `json:"type"`
-				Data struct {
-					RequestID string          `json:"request_id"`
-					Images    json.RawMessage `json:"images,omitempty"`
-					Places    json.RawMessage `json:"places,omitempty"`
-					Itinerary json.RawMessage `json:"itinerary,omitempty"`
-				} `json:"data"`
-			}
+            if err := json.Unmarshal(msg.Data, &envelope); err != nil { continue }
+            if envelope.Data.RequestID != id { continue }
 
-			if err := json.Unmarshal(msg.Data, &envelope); err != nil {
-				continue
-			}
+            switch msg.Subject {
+            case "trips.images":
+                if !receivedImages {
+                    receivedImages = true
+                    data, _ := json.Marshal(map[string]interface{}{"type": "images", "images": envelope.Data.Images})
+                    fmt.Fprintf(w, "event: images\ndata: %s\n\n", data)
+                    flusher.Flush()
+                }
+            case "trips.places":
+                if !receivedPlaces {
+                    receivedPlaces = true
+                    data, _ := json.Marshal(map[string]interface{}{"type": "places", "places": envelope.Data.Places})
+                    fmt.Fprintf(w, "event: places\ndata: %s\n\n", data)
+                    flusher.Flush()
+                }
+            
+            // 5. HANDLE VIBES EVENT
+            case "trips.vibes":
+                if !receivedVibes {
+                    receivedVibes = true
+                    data, _ := json.Marshal(map[string]interface{}{"type": "vibes", "vibes": envelope.Data.Vibes})
+                    fmt.Fprintf(w, "event: vibes\ndata: %s\n\n", data)
+                    flusher.Flush()
+                }
+                // Check if we can close now
+                if receivedItinerary && receivedVibes {
+                    fmt.Fprintf(w, "event: complete\ndata: {\"message\":\"All data received\"}\n\n")
+                    flusher.Flush()
+                    return
+                }
 
-			if envelope.Data.RequestID != id {
-				continue
-			}
-
-			switch msg.Subject {
-			case "trips.images":
-				if !receivedImages {
-					receivedImages = true
-					data, _ := json.Marshal(map[string]interface{}{"type": "images", "images": envelope.Data.Images})
-					fmt.Fprintf(w, "event: images\ndata: %s\n\n", data)
-					flusher.Flush()
-				}
-			case "trips.places":
-				if !receivedPlaces {
-					receivedPlaces = true
-					data, _ := json.Marshal(map[string]interface{}{"type": "places", "places": envelope.Data.Places})
-					fmt.Fprintf(w, "event: places\ndata: %s\n\n", data)
-					flusher.Flush()
-				}
-			case "trips.itinerary":
-				if !receivedItinerary {
-					receivedItinerary = true
-					data, _ := json.Marshal(map[string]interface{}{"type": "itinerary", "itinerary": envelope.Data.Itinerary})
-					fmt.Fprintf(w, "event: itinerary\ndata: %s\n\n", data)
-					flusher.Flush()
-					fmt.Fprintf(w, "event: complete\ndata: {\"message\":\"All data received\"}\n\n")
-					flusher.Flush()
-					return
-				}
-			}
-		}
-	}
+            case "trips.itinerary":
+                if !receivedItinerary {
+                    receivedItinerary = true
+                    data, _ := json.Marshal(map[string]interface{}{"type": "itinerary", "itinerary": envelope.Data.Itinerary})
+                    fmt.Fprintf(w, "event: itinerary\ndata: %s\n\n", data)
+                    flusher.Flush()
+                }
+                // Check if we can close now (wait for vibes too)
+                if receivedItinerary && receivedVibes {
+                    fmt.Fprintf(w, "event: complete\ndata: {\"message\":\"All data received\"}\n\n")
+                    flusher.Flush()
+                    return
+                }
+            }
+        }
+    }
 }
 
 // =====================================================
@@ -1357,4 +1389,65 @@ func (s *Server) consumePlaces(ctx context.Context) {
 			}
 		}
 	}
+}
+
+
+// Add this to your main.go or internal/server/consumers.go
+func (s *Server) consumeVibes(ctx context.Context) {
+    // 1. Setup Consumer
+    var cons jetstream.Consumer
+    for {
+        stream, err := s.js.Stream(ctx, "TRIPS")
+        if err == nil {
+            cons, err = stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+                Durable:       "api-vibes-writer-v1",
+                FilterSubject: "trips.vibes",
+                AckPolicy:     jetstream.AckExplicitPolicy,
+            })
+            if err == nil { break }
+        }
+        time.Sleep(2 * time.Second)
+    }
+
+    type VibesPayload struct {
+        Data struct {
+            RequestID string          `json:"request_id"`
+            Vibes     json.RawMessage `json:"vibes"` // Raw JSONB
+        } `json:"data"`
+    }
+
+    log.Println("Started Vibes DB Consumer")
+
+    // 2. Consume Loop
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        default:
+        }
+
+        msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
+        if err != nil { continue }
+
+        for msg := range msgs.Messages() {
+            var event VibesPayload
+            if err := json.Unmarshal(msg.Data(), &event); err != nil {
+                msg.Ack()
+                continue
+            }
+
+            // 3. Save to Postgres
+            // Requires: ALTER TABLE trips ADD COLUMN vibes JSONB;
+            _, err := s.db.Exec(`UPDATE trips SET vibes = $1, updated_at = NOW() WHERE request_id = $2`,
+                string(event.Data.Vibes), event.Data.RequestID)
+            
+            if err != nil {
+                log.Printf("Failed to save vibes to DB: %v", err)
+                msg.Nak()
+            } else {
+                log.Printf("Vibes saved to DB for %s", event.Data.RequestID)
+                msg.Ack()
+            }
+        }
+    }
 }

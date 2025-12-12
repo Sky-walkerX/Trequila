@@ -1,104 +1,119 @@
 package vibes
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"time"
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "time"
 )
 
-// PlaceInsights holds all the data we extract from the AI
-type PlaceInsights struct {
-	SafetyScore int    `json:"safety_score"` // 0-100
-	SafetyTip   string `json:"safety_tip"`   // "Watch for pickpockets"
-	CrowdLevel  string `json:"crowd_level"`  // "Low", "Medium", "High"
-	BestTime    string `json:"best_time"`    // "Before 10 AM"
-	Duration    string `json:"duration"`     // "1-2 hours"
-	PhotoTip    string `json:"photo_tip"`    // "View from Trocadero"
+// PlaceInfo is the input for the AI
+type PlaceInfo struct {
+    Name     string `json:"name"`
+    Category string `json:"category"`
 }
 
-// AnalyzePlaceWithAI calls Gemini to get a vibe check
-func AnalyzePlaceWithAI(apiKey, placeName, category string) PlaceInsights {
-	// Contextual Time (make the AI think about NOW)
-	now := time.Now()
-	month := now.Month().String()
-	hour := now.Hour()
-	timeContext := "daytime"
-	if hour > 18 || hour < 5 {
-		timeContext = "night time"
-	}
+// PlaceInsights is the output from the AI
+type PlaceInsights struct {
+    SafetyScore int    `json:"safety_score"`
+    SafetyTip   string `json:"safety_tip"`
+    CrowdLevel  string `json:"crowd_level"`
+    BestTime    string `json:"best_time"`
+    Duration    string `json:"duration"`
+    PhotoTip    string `json:"photo_tip"`
+}
 
-	// 🧠 The "Super Prompt"
-	prompt := fmt.Sprintf(`
-		Analyze the location '%s' (Category: %s) for a tourist visiting in %s during %s.
-		Provide a structured JSON analysis with:
-		1. safety_score: 0 (Dangerous) to 100 (Safe).
-		2. safety_tip: A short warning or advice (max 6 words).
-		3. crowd_level: Current expected crowds (Low/Medium/High/Extreme).
-		4. best_time: Best hour to visit to avoid crowds.
-		5. duration: Typical time spent there (e.g. "2 hours").
-		6. photo_tip: The best specific spot or angle for a photo.
+// BatchAnalyzePlaces sends ALL places to Gemini in one request
+func BatchAnalyzePlaces(apiKey string, places []PlaceInfo) map[string]PlaceInsights {
+    if len(places) == 0 {
+        return nil
+    }
 
-		Return ONLY raw JSON. No markdown blocks.
-		Example: {"safety_score": 90, "safety_tip": "Safe area", "crowd_level": "High", "best_time": "9 AM", "duration": "1 hr", "photo_tip": "From the bridge"}
-	`, placeName, category, month, timeContext)
+    // 1. Construct the Batch Prompt
+    placesJSON, _ := json.Marshal(places)
+    
+    now := time.Now()
+    month := now.Month().String()
+    timeContext := "daytime"
+    if now.Hour() > 18 || now.Hour() < 5 {
+        timeContext = "night time"
+    }
 
-	// Call Gemini (REST API)
-	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + apiKey
+    prompt := fmt.Sprintf(`
+        You are a travel safety and logistics expert.
+        Context: Tourist visiting in %s (%s).
+        
+        Analyze this list of places:
+        %s
 
-	requestBody := map[string]interface{}{
-		"contents": []map[string]interface{}{
-			{"parts": []map[string]string{{"text": prompt}}},
-		},
-		"generationConfig": map[string]interface{}{
-			"response_mime_type": "application/json",
-		},
-	}
+        Return a JSON Object where the KEY is the exact "name" from the list, and the VALUE is the analysis.
+        Strict JSON format. No markdown.
+        
+        Required fields for each place:
+        - safety_score: 0-100 integer
+        - safety_tip: max 6 words
+        - crowd_level: Low/Medium/High/Extreme
+        - best_time: specific hour (e.g. "9 AM")
+        - duration: e.g. "1-2 hours"
+        - photo_tip: specific angle/spot
 
-	jsonData, _ := json.Marshal(requestBody)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
-	
-	// Fallback defaults if AI fails
-	fallback := PlaceInsights{
-		SafetyScore: 85,
-		SafetyTip:   "Standard caution",
-		CrowdLevel:  "Unknown",
-		BestTime:    "Morning",
-		Duration:    "1 hour",
-		PhotoTip:    "Front entrance",
-	}
+        Example Output format:
+        {
+            "Eiffel Tower": { "safety_score": 85, "safety_tip": "Watch pockets", ... },
+            "Louvre": { "safety_score": 90, ... }
+        }
+    `, month, timeContext, string(placesJSON))
 
-	if err != nil {
-		return fallback
-	}
-	defer resp.Body.Close()
+    // 2. Call Gemini
+    url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey
 
-	// Parse Response
-	var geminiResp struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
-			} `json:"content"`
-		} `json:"candidates"`
-	}
+    requestBody := map[string]interface{}{
+        "contents": []map[string]interface{}{
+            {"parts": []map[string]string{{"text": prompt}}},
+        },
+        "generationConfig": map[string]interface{}{
+            "response_mime_type": "application/json",
+        },
+    }
 
-	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
-		return fallback
-	}
+    jsonBody, _ := json.Marshal(requestBody)
+    resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonBody))
+    if err != nil {
+        log.Printf("Vibes: AI Network Error: %v", err)
+        return nil
+    }
+    defer resp.Body.Close()
 
-	if len(geminiResp.Candidates) == 0 {
-		return fallback
-	}
+    // 3. Parse Response
+    var geminiResp struct {
+        Candidates []struct {
+            Content struct {
+                Parts []struct {
+                    Text string `json:"text"`
+                } `json:"parts"`
+            } `json:"content"`
+        } `json:"candidates"`
+    }
 
-	// Extract & Unmarshal the inner JSON
-	rawJSON := geminiResp.Candidates[0].Content.Parts[0].Text
-	var result PlaceInsights
-	if err := json.Unmarshal([]byte(rawJSON), &result); err != nil {
-		return fallback
-	}
+    if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+        log.Printf("Vibes: AI Decode Error: %v", err)
+        return nil
+    }
 
-	return result
+    if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
+        return nil
+    }
+
+    rawJSON := geminiResp.Candidates[0].Content.Parts[0].Text
+    
+    // 4. Unmarshal into Map
+    results := make(map[string]PlaceInsights)
+    if err := json.Unmarshal([]byte(rawJSON), &results); err != nil {
+        log.Printf("Vibes: Failed to parse AI JSON result: %v", err)
+        return nil
+    }
+
+    return results
 }

@@ -1,3 +1,4 @@
+// internal/vibes/weather.go
 package vibes
 
 import (
