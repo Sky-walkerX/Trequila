@@ -34,7 +34,6 @@ import (
 	"github.com/sky-walkerx/trequila/internal/vibes"
 	"github.com/sky-walkerx/trequila/internal/types"
 	"golang.org/x/time/rate"
-	"github.com/rs/cors"
 )
 
 // Server holds shared dependencies
