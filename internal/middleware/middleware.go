@@ -96,7 +96,7 @@ type CORSConfig struct {
 
 func DefaultCORSConfig() CORSConfig {
 	return CORSConfig{
-		AllowedOrigins:   []string{"*"}, // Change to specific domains in production
+		AllowedOrigins:   []string{"https://trequila.tech", "https://trequila-frontend.vercel.app", "https://www.trequila.tech"}, // Change to specific domains in production
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Requested-With"},
 		AllowCredentials: true,

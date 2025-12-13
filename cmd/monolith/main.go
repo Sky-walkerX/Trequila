@@ -114,33 +114,10 @@ func main() {
 	// 6. Setup HTTP server
 	handler := server.setupRoutes()
 
-	c := cors.New(cors.Options{
-        
-        AllowedOrigins: []string{"http://trequila.tech", "https://trequila-frontend.vercel.app", "https://www.trequila.tech"}, 
-        
-        // standard methods
-        AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-        
-        // Essential for JWT (Authorization) and JSON data (Content-Type)
-        AllowedHeaders: []string{"Authorization", "Content-Type", "Accept"},
-        
-        // Required if you are sending cookies or using Authorization headers
-        AllowCredentials: true,
-        
-        // consistent with your server timeout
-        MaxAge: 300, 
-        
-        // optional: set to true to debug CORS issues in console
-        Debug: false, 
-    })
-
-    // Wrap your existing handler with the CORS middleware
-    corsHandler := c.Handler(handler)
-
 	port := config.Port
 	srv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      corsHandler,
+		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 120 * time.Second, // Longer for SSE
 		IdleTimeout:  60 * time.Second,
