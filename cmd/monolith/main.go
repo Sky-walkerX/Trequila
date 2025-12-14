@@ -34,6 +34,7 @@ import (
 	"github.com/sky-walkerx/trequila/internal/vibes"
 	"github.com/sky-walkerx/trequila/internal/types"
 	"golang.org/x/time/rate"
+	
 )
 
 // Server holds shared dependencies
@@ -1004,16 +1005,16 @@ func (s *Server) handleCreateUserTrip(w http.ResponseWriter, r *http.Request, us
 func (s *Server) handleGetUserTrip(w http.ResponseWriter, r *http.Request, userID, tripID string) {
 	var status, source, destination, startDate, endDate string
 	var budget int
-	var itineraryJSON, imagesJSON, placesJSON []byte
+	var itineraryJSON, imagesJSON, placesJSON, vibesJSON []byte
 	var createdAt, updatedAt time.Time
 
 	err := s.db.QueryRow(`
 		SELECT status, source, destination, start_date, end_date, budget,
-		       itinerary, images, places, created_at, updated_at
+		       itinerary, images, places, vibes, created_at, updated_at
 		FROM trips WHERE request_id = $1 AND user_id = $2`,
 		tripID, userID,
 	).Scan(&status, &source, &destination, &startDate, &endDate, &budget,
-		&itineraryJSON, &imagesJSON, &placesJSON, &createdAt, &updatedAt)
+		&itineraryJSON, &imagesJSON, &placesJSON, &vibesJSON, &createdAt, &updatedAt)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, `{"error":"trip not found"}`, http.StatusNotFound)
@@ -1044,6 +1045,9 @@ func (s *Server) handleGetUserTrip(w http.ResponseWriter, r *http.Request, userI
 	if len(placesJSON) > 0 {
 		resp["places"] = json.RawMessage(placesJSON)
 	}
+	if len(vibesJSON) > 0 {
+        resp["vibes"] = json.RawMessage(vibesJSON)
+    }
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
