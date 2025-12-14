@@ -562,28 +562,20 @@ func (s *Server) handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
-	code := r.URL.Query().Get("code")
-	if code == "" {
-		http.Error(w, `{"error":"missing code parameter"}`, http.StatusBadRequest)
-		return
-	}
+    code := r.URL.Query().Get("code")
+    if code == "" {
+        http.Error(w, "missing code parameter", http.StatusBadRequest)
+        return
+    }
 
-	user, token, err := s.auth.HandleGoogleCallback(r.Context(), code)
-	if err != nil {
-		log.Printf("Google callback error: %v", err)
-		http.Error(w, `{"error":"authentication failed"}`, http.StatusUnauthorized)
-		return
-	}
+    _, token, err := s.auth.HandleGoogleCallback(r.Context(), code)
+    if err != nil {
+        http.Redirect(w, r, "https://trequila.tech/auth?error=auth_failed", http.StatusTemporaryRedirect)
+        return
+    }
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"token": token,
-		"user": map[string]string{
-			"id":    user.ID,
-			"email": user.Email,
-			"name":  user.Name,
-		},
-	})
+    frontendURL := fmt.Sprintf("https://trequila.tech/auth?token=%s", token)
+    http.Redirect(w, r, frontendURL, http.StatusTemporaryRedirect)
 }
 
 func (s *Server) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
