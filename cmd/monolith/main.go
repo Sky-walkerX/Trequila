@@ -1334,9 +1334,12 @@ func (s *Server) handlePhotoToTrip(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Validate content type
-	contentType := header.Header.Get("Content-Type")
-	if !strings.HasPrefix(contentType, "image/") {
+	// Validate and normalize content type (some clients send malformed values like image/image/jpeg).
+	contentType := strings.TrimSpace(strings.ToLower(header.Header.Get("Content-Type")))
+	if strings.HasPrefix(contentType, "image/image/") {
+		contentType = "image/" + strings.TrimPrefix(contentType, "image/image/")
+	}
+	if contentType == "" || !strings.HasPrefix(contentType, "image/") {
 		http.Error(w, `{"error":"file must be an image"}`, http.StatusBadRequest)
 		return
 	}
@@ -1345,6 +1348,9 @@ func (s *Server) handlePhotoToTrip(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, `{"error":"failed to read image"}`, http.StatusBadRequest)
 		return
+	}
+	if detected := strings.ToLower(http.DetectContentType(imgBytes)); strings.HasPrefix(detected, "image/") {
+		contentType = detected
 	}
 
 	// Call Gemini Vision to identify the location
