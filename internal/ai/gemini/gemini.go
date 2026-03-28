@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -62,19 +63,44 @@ func New(ctx context.Context, cfg ai.Config) (*Generator, error) {
 	}, nil
 }
 
-// GenerateItinerary generates a travel itinerary using Gemini AI
+// GenerateItinerary generates a travel itinerary using Gemini AI with retry logic
 func (g *Generator) GenerateItinerary(ctx context.Context, trip types.TripRequest) ([]types.DayPlan, error) {
 	prompt, err := g.buildPrompt(trip)
 	if err != nil {
 		return nil, fmt.Errorf("gemini: failed to build prompt: %w", err)
 	}
 
-	genCtx, cancel := context.WithTimeout(ctx, g.timeout)
-	defer cancel()
+	var resp *genai.GenerateContentResponse
+	const maxRetries = 3
 
-	resp, err := g.model.GenerateContent(genCtx, genai.Text(prompt))
-	if err != nil {
-		return nil, fmt.Errorf("gemini: API error: %w", err)
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		genCtx, cancel := context.WithTimeout(ctx, g.timeout)
+		resp, err = g.model.GenerateContent(genCtx, genai.Text(prompt))
+		cancel()
+
+		if err == nil {
+			break
+		}
+
+		// Retry on rate limit (429) or server errors (5xx)
+		errMsg := err.Error()
+		isRetryable := strings.Contains(errMsg, "429") ||
+			strings.Contains(errMsg, "503") ||
+			strings.Contains(errMsg, "500") ||
+			strings.Contains(errMsg, "resource exhausted") ||
+			strings.Contains(errMsg, "unavailable")
+
+		if !isRetryable || attempt == maxRetries {
+			return nil, fmt.Errorf("gemini: API error after %d attempts: %w", attempt+1, err)
+		}
+
+		backoff := time.Duration(1<<uint(attempt)) * time.Second // 1s, 2s, 4s
+		log.Printf("gemini: retrying in %v (attempt %d/%d): %v", backoff, attempt+1, maxRetries, err)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
 	return g.parseResponse(resp)

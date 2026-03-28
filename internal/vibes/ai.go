@@ -1,12 +1,15 @@
 package vibes
 
 import (
-    "bytes"
+    "context"
     "encoding/json"
     "fmt"
     "log"
-    "net/http"
+    "strings"
     "time"
+
+    "github.com/google/generative-ai-go/genai"
+    "google.golang.org/api/option"
 )
 
 // PlaceInfo is the input for the AI
@@ -25,15 +28,26 @@ type PlaceInsights struct {
     PhotoTip    string `json:"photo_tip"`
 }
 
-// BatchAnalyzePlaces sends ALL places to Gemini in one request
-func BatchAnalyzePlaces(apiKey string, places []PlaceInfo) map[string]PlaceInsights {
+// BatchAnalyzePlaces sends ALL places to Gemini in one request using the official SDK
+func BatchAnalyzePlaces(ctx context.Context, apiKey string, places []PlaceInfo) map[string]PlaceInsights {
     if len(places) == 0 {
         return nil
     }
 
-    // 1. Construct the Batch Prompt
+    client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+    if err != nil {
+        log.Printf("Vibes: Failed to create Gemini client: %v", err)
+        return nil
+    }
+    defer client.Close()
+
+    model := client.GenerativeModel("gemini-2.5-flash")
+    model.ResponseMIMEType = "application/json"
+    model.SetTemperature(0.4)
+
+    // Build the prompt
     placesJSON, _ := json.Marshal(places)
-    
+
     now := time.Now()
     month := now.Month().String()
     timeContext := "daytime"
@@ -66,49 +80,53 @@ func BatchAnalyzePlaces(apiKey string, places []PlaceInfo) map[string]PlaceInsig
         }
     `, month, timeContext, string(placesJSON))
 
-    // 2. Call Gemini
-    url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey
+    // Call Gemini with retry logic
+    var resp *genai.GenerateContentResponse
+    const maxRetries = 3
 
-    requestBody := map[string]interface{}{
-        "contents": []map[string]interface{}{
-            {"parts": []map[string]string{{"text": prompt}}},
-        },
-        "generationConfig": map[string]interface{}{
-            "response_mime_type": "application/json",
-        },
+    for attempt := 0; attempt <= maxRetries; attempt++ {
+        genCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+        resp, err = model.GenerateContent(genCtx, genai.Text(prompt))
+        cancel()
+
+        if err == nil {
+            break
+        }
+
+        errMsg := err.Error()
+        isRetryable := strings.Contains(errMsg, "429") ||
+            strings.Contains(errMsg, "503") ||
+            strings.Contains(errMsg, "500") ||
+            strings.Contains(errMsg, "resource exhausted") ||
+            strings.Contains(errMsg, "unavailable")
+
+        if !isRetryable || attempt == maxRetries {
+            log.Printf("Vibes: Gemini API error after %d attempts: %v", attempt+1, err)
+            return nil
+        }
+
+        backoff := time.Duration(1<<uint(attempt)) * time.Second
+        log.Printf("Vibes: retrying in %v (attempt %d/%d): %v", backoff, attempt+1, maxRetries, err)
+        select {
+        case <-time.After(backoff):
+        case <-ctx.Done():
+            return nil
+        }
     }
 
-    jsonBody, _ := json.Marshal(requestBody)
-    resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonBody))
-    if err != nil {
-        log.Printf("Vibes: AI Network Error: %v", err)
+    // Parse response
+    if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+        log.Printf("Vibes: Empty response from Gemini")
         return nil
     }
-    defer resp.Body.Close()
 
-    // 3. Parse Response
-    var geminiResp struct {
-        Candidates []struct {
-            Content struct {
-                Parts []struct {
-                    Text string `json:"text"`
-                } `json:"parts"`
-            } `json:"content"`
-        } `json:"candidates"`
+    var rawJSON string
+    for _, part := range resp.Candidates[0].Content.Parts {
+        if text, ok := part.(genai.Text); ok {
+            rawJSON += string(text)
+        }
     }
 
-    if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
-        log.Printf("Vibes: AI Decode Error: %v", err)
-        return nil
-    }
-
-    if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
-        return nil
-    }
-
-    rawJSON := geminiResp.Candidates[0].Content.Parts[0].Text
-    
-    // 4. Unmarshal into Map
     results := make(map[string]PlaceInsights)
     if err := json.Unmarshal([]byte(rawJSON), &results); err != nil {
         log.Printf("Vibes: Failed to parse AI JSON result: %v", err)

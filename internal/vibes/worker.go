@@ -40,8 +40,7 @@ type VibeData struct {
     PhotoTip    string `json:"photo_tip"`
 }
 
-func StartWorker(js jetstream.JetStream, apiKey string) {
-    ctx := context.Background()
+func StartWorker(ctx context.Context, js jetstream.JetStream, apiKey string) {
 
     // --- STEP 1: Find the Stream ---
     var stream jetstream.Stream
@@ -74,6 +73,13 @@ func StartWorker(js jetstream.JetStream, apiKey string) {
 
     // --- STEP 3: Start the Processing Loop ---
     for {
+        select {
+        case <-ctx.Done():
+            log.Println("Vibes: Worker shutting down...")
+            return
+        default:
+        }
+
         // Fetch messages
         msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
         if err != nil {
@@ -116,8 +122,7 @@ func StartWorker(js jetstream.JetStream, apiKey string) {
             }
 
             // 2. Call AI (ONE call for all places)
-            // Note: Ensure PlaceInfo is defined in ai.go
-            aiResults := BatchAnalyzePlaces(apiKey, placesToAnalyze)
+            aiResults := BatchAnalyzePlaces(ctx, apiKey, placesToAnalyze)
 
             // 3. Merge AI Data + Weather
             finalOutput := make(map[string]VibeData)

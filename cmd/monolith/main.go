@@ -8,15 +8,18 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/generative-ai-go/genai"
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/nats-io/nats.go"
@@ -34,15 +37,16 @@ import (
 	"github.com/sky-walkerx/trequila/internal/vibes"
 	"github.com/sky-walkerx/trequila/internal/types"
 	"golang.org/x/time/rate"
-	
+	"google.golang.org/api/option"
 )
 
 // Server holds shared dependencies
 type Server struct {
-	js   jetstream.JetStream
-	nc   *nats.Conn
-	db   *sql.DB
-	auth *auth.AuthService
+	js           jetstream.JetStream
+	nc           *nats.Conn
+	db           *sql.DB
+	auth         *auth.AuthService
+	geminiAPIKey string
 }
 
 func main() {
@@ -80,10 +84,11 @@ func main() {
 
 	// 4. Initialize services
 	server := &Server{
-		js:   js,
-		nc:   nc,
-		db:   db,
-		auth: auth.NewAuthService(db),
+		js:           js,
+		nc:           nc,
+		db:           db,
+		auth:         auth.NewAuthService(db),
+		geminiAPIKey: config.GeminiAPIKey,
 	}
 
 	// 5. Start background workers (microservices as goroutines)
@@ -131,6 +136,30 @@ func main() {
 			log.Fatalf("Server error: %v", err)
 		}
 	}()
+
+	// Keep-alive: prevent Heroku dyno from sleeping (pings own health endpoint every 25 min)
+	if os.Getenv("ENABLE_KEEP_ALIVE") == "true" {
+		go func() {
+			ticker := time.NewTicker(25 * time.Minute)
+			defer ticker.Stop()
+			pingURL := fmt.Sprintf("http://localhost:%s/ping", port)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					resp, err := http.Get(pingURL)
+					if err != nil {
+						log.Printf("Keep-alive ping failed: %v", err)
+					} else {
+						resp.Body.Close()
+						log.Println("Keep-alive ping OK")
+					}
+				}
+			}
+		}()
+		log.Println("Keep-alive enabled (25 min interval)")
+	}
 
 	// 7. Graceful shutdown
 	quit := make(chan os.Signal, 1)
@@ -448,9 +477,9 @@ func startPlacesWorker(ctx context.Context, js jetstream.JetStream, apiKey, redi
 
 func startVibesWorker(ctx context.Context, js jetstream.JetStream, apiKey string) {
 	if apiKey == "" { return }
-	
+
 	go func() {
-		vibes.StartWorker(js, apiKey)
+		vibes.StartWorker(ctx, js, apiKey)
 	}()
 }
 
@@ -486,6 +515,34 @@ func (s *Server) setupRoutes() http.Handler {
 	))
 	mux.Handle("/api/trips/", s.auth.AuthMiddleware(
 		http.HandlerFunc(s.instrumentHandler("/api/trips/{id}", s.handleTripByID)),
+	))
+
+	// Feature: Photo-to-Itinerary
+	mux.Handle("/api/trips/photo", s.auth.AuthMiddleware(
+		http.HandlerFunc(s.instrumentHandler("/api/trips/photo", s.handlePhotoToTrip)),
+	))
+
+	// Feature: Trip Chat
+	mux.Handle("/api/trips/chat/", s.auth.AuthMiddleware(
+		http.HandlerFunc(s.instrumentHandler("/api/trips/chat", s.handleTripChat)),
+	))
+
+	// Feature: Weather Replan
+	mux.Handle("/api/trips/replan/", s.auth.AuthMiddleware(
+		http.HandlerFunc(s.instrumentHandler("/api/trips/replan", s.handleWeatherReplan)),
+	))
+
+	// Feature: Share / Collaborate
+	mux.Handle("/api/trips/share/", s.auth.AuthMiddleware(
+		http.HandlerFunc(s.instrumentHandler("/api/trips/share", s.handleShareTrip)),
+	))
+	mux.Handle("/api/trips/join/", s.auth.AuthMiddleware(
+		http.HandlerFunc(s.instrumentHandler("/api/trips/join", s.handleJoinTrip)),
+	))
+
+	// Feature: Budget Tiers
+	mux.Handle("/api/trips/budget-tiers/", s.auth.AuthMiddleware(
+		http.HandlerFunc(s.instrumentHandler("/api/trips/budget-tiers", s.handleBudgetTiers)),
 	))
 
 	return middleware.CORS(corsConfig)(rateLimiter.Limit(mux))
@@ -1001,9 +1058,11 @@ func (s *Server) handleGetUserTrip(w http.ResponseWriter, r *http.Request, userI
 	var createdAt, updatedAt time.Time
 
 	err := s.db.QueryRow(`
-		SELECT status, source, destination, start_date, end_date, budget,
-		       itinerary, images, places, vibes, created_at, updated_at
-		FROM trips WHERE request_id = $1 AND user_id = $2`,
+		SELECT t.status, t.source, t.destination, t.start_date, t.end_date, t.budget,
+		       t.itinerary, t.images, t.places, t.vibes, t.created_at, t.updated_at
+		FROM trips t
+		LEFT JOIN trip_collaborators tc ON tc.trip_id = t.request_id AND tc.user_id = $2
+		WHERE t.request_id = $1 AND (t.user_id = $2 OR tc.user_id = $2)`,
 		tripID, userID,
 	).Scan(&status, &source, &destination, &startDate, &endDate, &budget,
 		&itineraryJSON, &imagesJSON, &placesJSON, &vibesJSON, &createdAt, &updatedAt)
@@ -1068,7 +1127,11 @@ func (s *Server) handleDeleteUserTrip(w http.ResponseWriter, r *http.Request, us
 
 func (s *Server) handleStreamTripAuth(w http.ResponseWriter, r *http.Request, userID, tripID string) {
 	var exists bool
-	s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM trips WHERE request_id = $1 AND user_id = $2)`, tripID, userID).Scan(&exists)
+	s.db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM trips WHERE request_id = $1 AND user_id = $2
+		UNION
+		SELECT 1 FROM trip_collaborators WHERE trip_id = $1 AND user_id = $2
+	)`, tripID, userID).Scan(&exists)
 	if !exists {
 		http.Error(w, `{"error":"trip not found"}`, http.StatusNotFound)
 		return
@@ -1150,13 +1213,15 @@ func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request
 
     // ... Subscription setup ...
     msgChan := make(chan *nats.Msg, 64)
-    // Optimization: Subscribe to specific ID to reduce CPU load
-    sub, err := s.nc.ChanSubscribe("trips.>", msgChan) 
+    sub, err := s.nc.ChanSubscribe("trips.>", msgChan)
     if err != nil { return }
     defer sub.Unsubscribe()
 
     ctx := r.Context()
     timeout := time.After(2 * time.Minute)
+
+    // Grace period: after itinerary arrives, wait up to 30s for vibes before completing
+    var vibesGrace <-chan time.Time
 
     for {
         select {
@@ -1164,6 +1229,11 @@ func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request
             return
         case <-timeout:
             fmt.Fprintf(w, "event: timeout\ndata: {\"message\":\"Stream timeout\"}\n\n")
+            flusher.Flush()
+            return
+        case <-vibesGrace:
+            // Vibes grace period expired — complete with partial data
+            fmt.Fprintf(w, "event: complete\ndata: {\"message\":\"All data received\"}\n\n")
             flusher.Flush()
             return
         case msg := <-msgChan:
@@ -1174,7 +1244,7 @@ func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request
                     Images    json.RawMessage `json:"images,omitempty"`
                     Places    json.RawMessage `json:"places,omitempty"`
                     Itinerary json.RawMessage `json:"itinerary,omitempty"`
-                    Vibes     json.RawMessage `json:"vibes,omitempty"` // Add Vibes
+                    Vibes     json.RawMessage `json:"vibes,omitempty"`
                 } `json:"data"`
             }
 
@@ -1196,8 +1266,7 @@ func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request
                     fmt.Fprintf(w, "event: places\ndata: %s\n\n", data)
                     flusher.Flush()
                 }
-            
-            // 5. HANDLE VIBES EVENT
+
             case "trips.vibes":
                 if !receivedVibes {
                     receivedVibes = true
@@ -1205,8 +1274,7 @@ func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request
                     fmt.Fprintf(w, "event: vibes\ndata: %s\n\n", data)
                     flusher.Flush()
                 }
-                // Check if we can close now
-                if receivedItinerary && receivedVibes {
+                if receivedItinerary {
                     fmt.Fprintf(w, "event: complete\ndata: {\"message\":\"All data received\"}\n\n")
                     flusher.Flush()
                     return
@@ -1219,15 +1287,870 @@ func (s *Server) handleStreamTripInternal(w http.ResponseWriter, r *http.Request
                     fmt.Fprintf(w, "event: itinerary\ndata: %s\n\n", data)
                     flusher.Flush()
                 }
-                // Check if we can close now (wait for vibes too)
-                if receivedItinerary && receivedVibes {
+                if receivedVibes {
                     fmt.Fprintf(w, "event: complete\ndata: {\"message\":\"All data received\"}\n\n")
                     flusher.Flush()
                     return
                 }
+                // Start grace period — give vibes 30s to arrive
+                if vibesGrace == nil {
+                    vibesGrace = time.After(30 * time.Second)
+                }
             }
         }
     }
+}
+
+// =====================================================
+// FEATURE: PHOTO-TO-ITINERARY (Gemini Vision)
+// =====================================================
+
+func (s *Server) handlePhotoToTrip(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := auth.GetUserIDFromContext(r.Context())
+	if userID == "" {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	if s.geminiAPIKey == "" {
+		http.Error(w, `{"error":"photo analysis not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	// Parse multipart form (max 10MB)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, `{"error":"file too large (max 10MB)"}`, http.StatusBadRequest)
+		return
+	}
+
+	file, header, err := r.FormFile("photo")
+	if err != nil {
+		http.Error(w, `{"error":"photo field required"}`, http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// Validate content type
+	contentType := header.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "image/") {
+		http.Error(w, `{"error":"file must be an image"}`, http.StatusBadRequest)
+		return
+	}
+
+	imgBytes, err := io.ReadAll(io.LimitReader(file, 10<<20))
+	if err != nil {
+		http.Error(w, `{"error":"failed to read image"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Call Gemini Vision to identify the location
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	client, err := genai.NewClient(ctx, option.WithAPIKey(s.geminiAPIKey))
+	if err != nil {
+		log.Printf("Photo: Gemini client error: %v", err)
+		http.Error(w, `{"error":"AI service unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
+	defer client.Close()
+
+	model := client.GenerativeModel("gemini-2.5-flash")
+	model.ResponseMIMEType = "application/json"
+	model.SetTemperature(0.3)
+
+	prompt := `Analyze this travel photo and identify the location.
+Return ONLY a JSON object with this exact structure (no markdown):
+{
+  "destination": "City, Country",
+  "description": "Brief description of the place in the photo",
+  "suggested_days": 3,
+  "interests": ["interest1", "interest2"]
+}
+If you cannot identify the location, set destination to "" and description to "Could not identify location".`
+
+	resp, err := model.GenerateContent(ctx,
+		genai.ImageData(contentType, imgBytes),
+		genai.Text(prompt),
+	)
+	if err != nil {
+		log.Printf("Photo: Gemini error: %v", err)
+		http.Error(w, `{"error":"failed to analyze photo"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+		http.Error(w, `{"error":"no analysis result"}`, http.StatusInternalServerError)
+		return
+	}
+
+	var fullText strings.Builder
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if text, ok := part.(genai.Text); ok {
+			fullText.WriteString(string(text))
+		}
+	}
+
+	var result struct {
+		Destination   string   `json:"destination"`
+		Description   string   `json:"description"`
+		SuggestedDays int      `json:"suggested_days"`
+		Interests     []string `json:"interests"`
+	}
+
+	jsonStr := strings.TrimSpace(fullText.String())
+	// Extract JSON object
+	if start := strings.Index(jsonStr, "{"); start != -1 {
+		if end := strings.LastIndex(jsonStr, "}"); end > start {
+			jsonStr = jsonStr[start : end+1]
+		}
+	}
+
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		log.Printf("Photo: Parse error: %v (raw: %s)", err, jsonStr)
+		http.Error(w, `{"error":"failed to parse analysis"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if result.Destination == "" {
+		http.Error(w, `{"error":"could not identify location from photo"}`, http.StatusUnprocessableEntity)
+		return
+	}
+
+	if result.SuggestedDays < 1 {
+		result.SuggestedDays = 3
+	}
+
+	// Auto-create trip with identified destination
+	startDate := time.Now().AddDate(0, 1, 0) // Default: 1 month from now
+	endDate := startDate.AddDate(0, 0, result.SuggestedDays-1)
+
+	// Override with form fields if provided
+	if sd := r.FormValue("start_date"); sd != "" {
+		if parsed, err := time.Parse("2006-01-02", sd); err == nil {
+			startDate = parsed
+		}
+	}
+	if ed := r.FormValue("end_date"); ed != "" {
+		if parsed, err := time.Parse("2006-01-02", ed); err == nil {
+			endDate = parsed
+		}
+	}
+	source := r.FormValue("source")
+	if source == "" {
+		source = "Not specified"
+	}
+	budget := 0
+	if b := r.FormValue("budget"); b != "" {
+		if parsed, err := strconv.Atoi(b); err == nil {
+			budget = parsed
+		}
+	}
+
+	requestID := uuid.NewString()
+
+	_, err = s.db.Exec(`
+		INSERT INTO trips (request_id, user_id, source, destination, start_date, end_date, budget, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
+		requestID, userID, source, result.Destination,
+		startDate.Format("2006-01-02"), endDate.Format("2006-01-02"), budget,
+	)
+	if err != nil {
+		log.Printf("Photo: DB error: %v", err)
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	days := int(endDate.Sub(startDate).Hours()/24) + 1
+
+	event := types.TripEvent{
+		Type: "TripRequested",
+		Data: types.TripRequest{
+			RequestID:   requestID,
+			UserID:      userID,
+			Source:      source,
+			Destination: result.Destination,
+			StartDate:   startDate.Format("2006-01-02"),
+			EndDate:     endDate.Format("2006-01-02"),
+			Days:        days,
+			Budget:      budget,
+			Interests:   result.Interests,
+			CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+		},
+	}
+
+	data, _ := json.Marshal(event)
+	pubCtx, pubCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer pubCancel()
+
+	_, err = s.js.Publish(pubCtx, "trips.requested", data, jetstream.WithMsgID(requestID))
+	if err != nil {
+		log.Printf("Photo: NATS publish error: %v", err)
+		http.Error(w, `{"error":"failed to queue trip"}`, http.StatusInternalServerError)
+		return
+	}
+
+	metrics.TripsCreatedTotal.Inc()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"request_id":  requestID,
+		"status":      "pending",
+		"destination": result.Destination,
+		"description": result.Description,
+		"start_date":  startDate.Format("2006-01-02"),
+		"end_date":    endDate.Format("2006-01-02"),
+		"days":        days,
+		"interests":   result.Interests,
+		"message":     "Trip created from photo analysis",
+	})
+}
+
+// =====================================================
+// FEATURE: WEATHER-ADAPTIVE REPLANNING
+// =====================================================
+
+func (s *Server) handleWeatherReplan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := auth.GetUserIDFromContext(r.Context())
+	if userID == "" {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	tripID := strings.TrimPrefix(r.URL.Path, "/api/trips/replan/")
+	if tripID == "" {
+		http.Error(w, `{"error":"trip id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Get existing trip data
+	var destination string
+	var itineraryJSON []byte
+	err := s.db.QueryRow(`
+		SELECT destination, itinerary FROM trips
+		WHERE request_id = $1 AND user_id = $2 AND itinerary IS NOT NULL`,
+		tripID, userID,
+	).Scan(&destination, &itineraryJSON)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, `{"error":"trip not found or no itinerary yet"}`, http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	var itinerary []types.DayPlan
+	if err := json.Unmarshal(itineraryJSON, &itinerary); err != nil {
+		http.Error(w, `{"error":"corrupted itinerary data"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Parse optional request body for specific day index
+	var req struct {
+		DayIndex *int `json:"day_index"` // nil = replan all rainy days
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	if s.geminiAPIKey == "" {
+		http.Error(w, `{"error":"replanning not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	// Fetch weather forecast for the destination
+	// Use geocoding to get lat/lon (we'll use a simple approach)
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	// Identify rainy days using Open-Meteo forecast
+	forecastURL := fmt.Sprintf(
+		"https://api.open-meteo.com/v1/forecast?latitude=0&longitude=0&daily=weathercode,temperature_2m_max&timezone=auto&forecast_days=%d",
+		len(itinerary),
+	)
+	// We need lat/lon — fetch from geocoding
+	geoURL := fmt.Sprintf("https://geocoding-api.open-meteo.com/v1/search?name=%s&count=1", strings.ReplaceAll(destination, " ", "+"))
+	geoResp, err := http.Get(geoURL)
+	if err == nil {
+		defer geoResp.Body.Close()
+		var geoData struct {
+			Results []struct {
+				Lat float64 `json:"latitude"`
+				Lon float64 `json:"longitude"`
+			} `json:"results"`
+		}
+		if json.NewDecoder(geoResp.Body).Decode(&geoData) == nil && len(geoData.Results) > 0 {
+			forecastURL = fmt.Sprintf(
+				"https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&daily=weathercode,temperature_2m_max&timezone=auto&forecast_days=%d",
+				geoData.Results[0].Lat, geoData.Results[0].Lon, len(itinerary),
+			)
+		}
+	}
+
+	// Fetch weather forecast
+	type weatherForecast struct {
+		Daily struct {
+			WeatherCode []int     `json:"weathercode"`
+			MaxTemp     []float64 `json:"temperature_2m_max"`
+		} `json:"daily"`
+	}
+
+	var forecast weatherForecast
+	wResp, err := http.Get(forecastURL)
+	if err == nil {
+		defer wResp.Body.Close()
+		json.NewDecoder(wResp.Body).Decode(&forecast)
+	}
+
+	// Determine which days need replanning
+	rainyDays := []int{} // indices into itinerary
+	weatherInfo := map[int]string{}
+	for i, code := range forecast.Daily.WeatherCode {
+		if i >= len(itinerary) {
+			break
+		}
+		if code >= 51 { // Rain/Storm codes per WMO
+			rainyDays = append(rainyDays, i)
+			temp := 0.0
+			if i < len(forecast.Daily.MaxTemp) {
+				temp = forecast.Daily.MaxTemp[i]
+			}
+			emoji := "🌧️"
+			if code >= 95 {
+				emoji = "⛈️"
+			}
+			weatherInfo[i] = fmt.Sprintf("%.0f°C %s", temp, emoji)
+		}
+	}
+
+	// If specific day requested, only replan that day
+	if req.DayIndex != nil {
+		found := false
+		for _, d := range rainyDays {
+			if d == *req.DayIndex {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// User wants to force-replan a specific day regardless of weather
+			rainyDays = []int{*req.DayIndex}
+			weatherInfo[*req.DayIndex] = "User requested replan"
+		} else {
+			rainyDays = []int{*req.DayIndex}
+		}
+	}
+
+	if len(rainyDays) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"message":      "No rainy days detected — itinerary looks good!",
+			"rainy_days":   []int{},
+			"replanned":    false,
+			"itinerary":    itinerary,
+		})
+		return
+	}
+
+	// Call Gemini to replan rainy days
+	client, err := genai.NewClient(ctx, option.WithAPIKey(s.geminiAPIKey))
+	if err != nil {
+		http.Error(w, `{"error":"AI service unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
+	defer client.Close()
+
+	model := client.GenerativeModel("gemini-2.5-flash")
+	model.ResponseMIMEType = "application/json"
+	model.SetTemperature(0.7)
+
+	// Build replan prompt
+	daysToReplan := []types.DayPlan{}
+	for _, idx := range rainyDays {
+		if idx < len(itinerary) {
+			daysToReplan = append(daysToReplan, itinerary[idx])
+		}
+	}
+	daysJSON, _ := json.Marshal(daysToReplan)
+
+	prompt := fmt.Sprintf(`You are an expert travel planner. The following days of a trip to %s have BAD WEATHER (rain/storms).
+Replace outdoor activities with indoor alternatives while keeping the same time structure and budget.
+
+Days to replan (JSON):
+%s
+
+Weather conditions:
+%v
+
+Requirements:
+- Keep the same dayIndex, date, and time slots
+- Replace outdoor activities (Nature, Attraction with outdoor venues) with indoor alternatives (museums, galleries, indoor markets, cooking classes, spa, etc.)
+- Keep restaurants and indoor activities as-is
+- Maintain similar budget levels
+- Return ONLY a JSON array of the replanned days with the same structure
+
+Return a JSON array of replanned day objects.`, destination, string(daysJSON), weatherInfo)
+
+	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		log.Printf("Replan: Gemini error: %v", err)
+		http.Error(w, `{"error":"failed to generate alternatives"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+		http.Error(w, `{"error":"no replan result"}`, http.StatusInternalServerError)
+		return
+	}
+
+	var respText strings.Builder
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if text, ok := part.(genai.Text); ok {
+			respText.WriteString(string(text))
+		}
+	}
+
+	jsonStr := strings.TrimSpace(respText.String())
+	if start := strings.Index(jsonStr, "["); start != -1 {
+		if end := strings.LastIndex(jsonStr, "]"); end > start {
+			jsonStr = jsonStr[start : end+1]
+		}
+	}
+
+	var replannedDays []types.DayPlan
+	if err := json.Unmarshal([]byte(jsonStr), &replannedDays); err != nil {
+		log.Printf("Replan: Parse error: %v", err)
+		http.Error(w, `{"error":"failed to parse replanned itinerary"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Merge replanned days into original itinerary
+	replannedMap := map[int]types.DayPlan{}
+	for _, day := range replannedDays {
+		replannedMap[day.DayIndex] = day
+	}
+	for i := range itinerary {
+		if replacement, ok := replannedMap[itinerary[i].DayIndex]; ok {
+			itinerary[i] = replacement
+		}
+	}
+
+	// Save updated itinerary
+	updatedJSON, _ := json.Marshal(itinerary)
+	s.db.Exec(`UPDATE trips SET itinerary = $1, updated_at = NOW() WHERE request_id = $2`,
+		string(updatedJSON), tripID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":      fmt.Sprintf("Replanned %d day(s) with indoor alternatives", len(rainyDays)),
+		"rainy_days":   rainyDays,
+		"weather":      weatherInfo,
+		"replanned":    true,
+		"itinerary":    itinerary,
+	})
+}
+
+// =====================================================
+// FEATURE: LIVE TRIP COMPANION CHAT
+// =====================================================
+
+func (s *Server) handleTripChat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := auth.GetUserIDFromContext(r.Context())
+	if userID == "" {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	tripID := strings.TrimPrefix(r.URL.Path, "/api/trips/chat/")
+	if tripID == "" {
+		http.Error(w, `{"error":"trip id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Message string `json:"message"`
+		History []struct {
+			Role    string `json:"role"` // "user" or "model"
+			Content string `json:"content"`
+		} `json:"history"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Message == "" {
+		http.Error(w, `{"error":"message field required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Load trip context
+	var destination, source, startDate, endDate string
+	var budget int
+	var itineraryJSON []byte
+	err := s.db.QueryRow(`
+		SELECT source, destination, start_date, end_date, budget, itinerary
+		FROM trips WHERE request_id = $1 AND user_id = $2`,
+		tripID, userID,
+	).Scan(&source, &destination, &startDate, &endDate, &budget, &itineraryJSON)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, `{"error":"trip not found"}`, http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if s.geminiAPIKey == "" {
+		http.Error(w, `{"error":"chat not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	client, err := genai.NewClient(ctx, option.WithAPIKey(s.geminiAPIKey))
+	if err != nil {
+		http.Error(w, `{"error":"AI service unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
+	defer client.Close()
+
+	model := client.GenerativeModel("gemini-2.5-flash")
+	model.SetTemperature(0.8)
+	model.SystemInstruction = genai.NewUserContent(genai.Text(fmt.Sprintf(
+		`You are a friendly and knowledgeable travel companion for a trip from %s to %s (%s to %s, budget $%d).
+Current itinerary: %s
+
+Help the user with:
+- Local tips, restaurant recommendations, hidden gems
+- Activity modifications ("make day 2 cheaper", "add more food spots")
+- Safety advice, cultural etiquette, transport tips
+- Packing suggestions, visa/currency info
+Keep responses concise and helpful. If suggesting itinerary changes, describe them clearly.`,
+		source, destination, startDate, endDate, budget, string(itineraryJSON),
+	)))
+
+	// Build chat with history
+	chat := model.StartChat()
+	for _, h := range req.History {
+		role := h.Role
+		if role == "assistant" {
+			role = "model"
+		}
+		chat.History = append(chat.History, &genai.Content{
+			Role:  role,
+			Parts: []genai.Part{genai.Text(h.Content)},
+		})
+	}
+
+	resp, err := chat.SendMessage(ctx, genai.Text(req.Message))
+	if err != nil {
+		log.Printf("Chat: Gemini error: %v", err)
+		http.Error(w, `{"error":"failed to get response"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+		http.Error(w, `{"error":"no response from AI"}`, http.StatusInternalServerError)
+		return
+	}
+
+	var reply strings.Builder
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if text, ok := part.(genai.Text); ok {
+			reply.WriteString(string(text))
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"reply":   reply.String(),
+		"trip_id": tripID,
+	})
+}
+
+// =====================================================
+// FEATURE: COLLABORATIVE TRIP PLANNING
+// =====================================================
+
+func (s *Server) handleShareTrip(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := auth.GetUserIDFromContext(r.Context())
+	if userID == "" {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	tripID := strings.TrimPrefix(r.URL.Path, "/api/trips/share/")
+	if tripID == "" {
+		http.Error(w, `{"error":"trip id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Verify trip ownership
+	var exists bool
+	s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM trips WHERE request_id = $1 AND user_id = $2)`,
+		tripID, userID).Scan(&exists)
+	if !exists {
+		http.Error(w, `{"error":"trip not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Generate a share code (first 8 chars of a UUID, URL-safe)
+	shareCode := uuid.NewString()[:8]
+
+	// Save share code to DB
+	_, err := s.db.Exec(`UPDATE trips SET share_code = $1 WHERE request_id = $2`, shareCode, tripID)
+	if err != nil {
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"share_code": shareCode,
+		"trip_id":    tripID,
+		"message":    "Trip shared! Others can join with this code.",
+	})
+}
+
+func (s *Server) handleJoinTrip(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := auth.GetUserIDFromContext(r.Context())
+	if userID == "" {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	shareCode := strings.TrimPrefix(r.URL.Path, "/api/trips/join/")
+	if shareCode == "" {
+		http.Error(w, `{"error":"share code required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Find trip by share code
+	var tripID, destination, source, startDate, endDate, status string
+	var budget int
+	err := s.db.QueryRow(`
+		SELECT request_id, source, destination, start_date, end_date, budget, status
+		FROM trips WHERE share_code = $1`,
+		shareCode,
+	).Scan(&tripID, &source, &destination, &startDate, &endDate, &budget, &status)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, `{"error":"invalid share code"}`, http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Add collaborator
+	_, err = s.db.Exec(`
+		INSERT INTO trip_collaborators (trip_id, user_id) VALUES ($1, $2)
+		ON CONFLICT DO NOTHING`,
+		tripID, userID,
+	)
+	if err != nil {
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"trip_id":     tripID,
+		"destination": destination,
+		"source":      source,
+		"start_date":  startDate,
+		"end_date":    endDate,
+		"budget":      budget,
+		"status":      status,
+		"message":     "Successfully joined trip!",
+	})
+}
+
+// =====================================================
+// FEATURE: BUDGET OPTIMIZER TIERS
+// =====================================================
+
+func (s *Server) handleBudgetTiers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := auth.GetUserIDFromContext(r.Context())
+	if userID == "" {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	tripID := strings.TrimPrefix(r.URL.Path, "/api/trips/budget-tiers/")
+	if tripID == "" {
+		http.Error(w, `{"error":"trip id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Load trip data
+	var destination, source, startDate, endDate string
+	var budget int
+	var itineraryJSON []byte
+	err := s.db.QueryRow(`
+		SELECT source, destination, start_date, end_date, budget, itinerary
+		FROM trips WHERE request_id = $1 AND user_id = $2`,
+		tripID, userID,
+	).Scan(&source, &destination, &startDate, &endDate, &budget, &itineraryJSON)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, `{"error":"trip not found"}`, http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if s.geminiAPIKey == "" {
+		http.Error(w, `{"error":"budget tiers not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+
+	// Generate 3 tiers in parallel
+	tiers := []struct {
+		Name       string
+		Multiplier float64
+		Label      string
+	}{
+		{"budget", 0.5, "Budget-Friendly"},
+		{"mid", 1.0, "Mid-Range"},
+		{"luxury", 2.5, "Luxury"},
+	}
+
+	type tierResult struct {
+		Tier      string           `json:"tier"`
+		Label     string           `json:"label"`
+		Itinerary []types.DayPlan  `json:"itinerary"`
+		Budget    int              `json:"estimated_budget"`
+		Error     string           `json:"error,omitempty"`
+	}
+
+	results := make([]tierResult, 3)
+	var wg sync.WaitGroup
+
+	for i, tier := range tiers {
+		wg.Add(1)
+		go func(idx int, t struct {
+			Name       string
+			Multiplier float64
+			Label      string
+		}) {
+			defer wg.Done()
+
+			tierBudget := int(float64(budget) * t.Multiplier)
+			if tierBudget == 0 {
+				tierBudget = int(float64(1500) * t.Multiplier) // Default if no budget set
+			}
+
+			client, err := genai.NewClient(ctx, option.WithAPIKey(s.geminiAPIKey))
+			if err != nil {
+				results[idx] = tierResult{Tier: t.Name, Label: t.Label, Error: "AI unavailable"}
+				return
+			}
+			defer client.Close()
+
+			model := client.GenerativeModel("gemini-2.5-flash")
+			model.ResponseMIMEType = "application/json"
+			model.SetTemperature(0.7)
+
+			startD, _ := time.Parse("2006-01-02", startDate)
+			endD, _ := time.Parse("2006-01-02", endDate)
+			days := int(endD.Sub(startD).Hours()/24) + 1
+
+			prompt := fmt.Sprintf(`Generate a %s (%s tier) %d-day travel itinerary for %s.
+Budget: approximately $%d total.
+Dates: %s to %s.
+Travel style: %s
+
+Return ONLY a JSON array with this structure:
+[{"dayIndex": 0, "date": "YYYY-MM-DD", "summary": "...", "activities": [{"name": "...", "type": "Attraction", "time": "9:00 AM", "description": "...", "address": "...", "notes": "...", "budget": 25}]}]
+
+Requirements:
+- 3-5 activities per day with realistic pricing for %s tier
+- Budget tier means hostels, street food, free attractions, public transit
+- Mid-range means 3-star hotels, local restaurants, popular attractions
+- Luxury means 5-star hotels, fine dining, VIP experiences, private tours
+- Activity budgets must reflect the tier pricing`,
+				t.Label, t.Name, days, destination, tierBudget, startDate, endDate, t.Label, t.Name)
+
+			resp, err := model.GenerateContent(ctx, genai.Text(prompt))
+			if err != nil {
+				results[idx] = tierResult{Tier: t.Name, Label: t.Label, Budget: tierBudget, Error: "generation failed"}
+				return
+			}
+
+			if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+				results[idx] = tierResult{Tier: t.Name, Label: t.Label, Budget: tierBudget, Error: "empty response"}
+				return
+			}
+
+			var text strings.Builder
+			for _, part := range resp.Candidates[0].Content.Parts {
+				if t, ok := part.(genai.Text); ok {
+					text.WriteString(string(t))
+				}
+			}
+
+			jsonStr := strings.TrimSpace(text.String())
+			if start := strings.Index(jsonStr, "["); start != -1 {
+				if end := strings.LastIndex(jsonStr, "]"); end > start {
+					jsonStr = jsonStr[start : end+1]
+				}
+			}
+
+			var itin []types.DayPlan
+			if err := json.Unmarshal([]byte(jsonStr), &itin); err != nil {
+				results[idx] = tierResult{Tier: t.Name, Label: t.Label, Budget: tierBudget, Error: "parse failed"}
+				return
+			}
+
+			results[idx] = tierResult{
+				Tier:      t.Name,
+				Label:     t.Label,
+				Itinerary: itin,
+				Budget:    tierBudget,
+			}
+		}(i, tier)
+	}
+
+	wg.Wait()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"trip_id": tripID,
+		"tiers":   results,
+	})
 }
 
 // =====================================================

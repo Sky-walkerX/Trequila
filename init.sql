@@ -28,9 +28,19 @@ CREATE TABLE IF NOT EXISTS trips (
     itinerary JSONB,
     images JSONB,
     places JSONB,
-    vibes JSONB
+    vibes JSONB,
+    share_code VARCHAR(8) UNIQUE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_trips_user_id ON trips(user_id);
+CREATE INDEX IF NOT EXISTS idx_trips_share_code ON trips(share_code);
+
+-- Trip collaborators table (for collaborative trip planning)
+CREATE TABLE IF NOT EXISTS trip_collaborators (
+    trip_id TEXT NOT NULL REFERENCES trips(request_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    joined_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (trip_id, user_id)
+);

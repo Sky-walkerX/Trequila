@@ -68,3 +68,4 @@ local.yaml
 config.local.*
 .env
 trequila.creds
+monolith
