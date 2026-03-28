@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1334,23 +1336,53 @@ func (s *Server) handlePhotoToTrip(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Validate and normalize content type (some clients send malformed values like image/image/jpeg).
-	contentType := strings.TrimSpace(strings.ToLower(header.Header.Get("Content-Type")))
-	if strings.HasPrefix(contentType, "image/image/") {
-		contentType = "image/" + strings.TrimPrefix(contentType, "image/image/")
-	}
-	if contentType == "" || !strings.HasPrefix(contentType, "image/") {
-		http.Error(w, `{"error":"file must be an image"}`, http.StatusBadRequest)
-		return
-	}
-
 	imgBytes, err := io.ReadAll(io.LimitReader(file, 10<<20))
 	if err != nil {
 		http.Error(w, `{"error":"failed to read image"}`, http.StatusBadRequest)
 		return
 	}
-	if detected := strings.ToLower(http.DetectContentType(imgBytes)); strings.HasPrefix(detected, "image/") {
-		contentType = detected
+
+	// Validate and normalize content type.
+	rawContentType := strings.TrimSpace(strings.ToLower(header.Header.Get("Content-Type")))
+	contentType := rawContentType
+	if parsed, _, err := mime.ParseMediaType(contentType); err == nil {
+		contentType = strings.ToLower(strings.TrimSpace(parsed))
+	}
+	if strings.HasPrefix(contentType, "image/image/") {
+		contentType = "image/" + strings.TrimPrefix(contentType, "image/image/")
+	}
+	if contentType == "image/jpg" {
+		contentType = "image/jpeg"
+	}
+
+	detectedType := strings.ToLower(strings.TrimSpace(http.DetectContentType(imgBytes)))
+	if parsed, _, err := mime.ParseMediaType(detectedType); err == nil {
+		detectedType = strings.ToLower(strings.TrimSpace(parsed))
+	}
+	if detectedType == "image/jpg" {
+		detectedType = "image/jpeg"
+	}
+	if strings.HasPrefix(detectedType, "image/") {
+		contentType = detectedType
+	}
+
+	if !isSupportedGeminiImageMIME(contentType) {
+		switch strings.ToLower(filepath.Ext(header.Filename)) {
+		case ".jpg", ".jpeg":
+			contentType = "image/jpeg"
+		case ".png":
+			contentType = "image/png"
+		case ".webp":
+			contentType = "image/webp"
+		case ".gif":
+			contentType = "image/gif"
+		}
+	}
+
+	if !isSupportedGeminiImageMIME(contentType) {
+		log.Printf("Photo: invalid mime header=%q detected=%q filename=%q", rawContentType, detectedType, header.Filename)
+		http.Error(w, `{"error":"unsupported image format (use JPG, PNG, WEBP, or GIF)"}`, http.StatusBadRequest)
+		return
 	}
 
 	// Call Gemini Vision to identify the location
@@ -1515,6 +1547,15 @@ If you cannot identify the location, set destination to "" and description to "C
 		"interests":   result.Interests,
 		"message":     "Trip created from photo analysis",
 	})
+}
+
+func isSupportedGeminiImageMIME(contentType string) bool {
+	switch contentType {
+	case "image/jpeg", "image/png", "image/webp", "image/gif":
+		return true
+	default:
+		return false
+	}
 }
 
 // =====================================================
