@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -2034,10 +2033,25 @@ func (s *Server) handleBudgetTiers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Stream results via SSE so the browser doesn't time out during the ~15s Gemini calls.
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, `{"error":"streaming unsupported"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 
-	// Generate 3 tiers in parallel
+	_ = source // suppress unused warning
+
 	tiers := []struct {
 		Name       string
 		Multiplier float64
@@ -2049,33 +2063,29 @@ func (s *Server) handleBudgetTiers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type tierResult struct {
-		Tier      string           `json:"tier"`
-		Label     string           `json:"label"`
-		Itinerary []types.DayPlan  `json:"itinerary"`
-		Budget    int              `json:"estimated_budget"`
-		Error     string           `json:"error,omitempty"`
+		Tier      string          `json:"tier"`
+		Label     string          `json:"label"`
+		Itinerary []types.DayPlan `json:"itinerary"`
+		Budget    int             `json:"estimated_budget"`
+		Error     string          `json:"error,omitempty"`
 	}
 
-	results := make([]tierResult, 3)
-	var wg sync.WaitGroup
+	resultCh := make(chan tierResult, 3)
 
-	for i, tier := range tiers {
-		wg.Add(1)
-		go func(idx int, t struct {
+	for _, tier := range tiers {
+		go func(t struct {
 			Name       string
 			Multiplier float64
 			Label      string
 		}) {
-			defer wg.Done()
-
 			tierBudget := int(float64(budget) * t.Multiplier)
 			if tierBudget == 0 {
-				tierBudget = int(float64(1500) * t.Multiplier) // Default if no budget set
+				tierBudget = int(float64(1500) * t.Multiplier)
 			}
 
 			client, err := genai.NewClient(ctx, option.WithAPIKey(s.geminiAPIKey))
 			if err != nil {
-				results[idx] = tierResult{Tier: t.Name, Label: t.Label, Error: "AI unavailable"}
+				resultCh <- tierResult{Tier: t.Name, Label: t.Label, Error: "AI unavailable"}
 				return
 			}
 			defer client.Close()
@@ -2106,19 +2116,19 @@ Requirements:
 
 			resp, err := model.GenerateContent(ctx, genai.Text(prompt))
 			if err != nil {
-				results[idx] = tierResult{Tier: t.Name, Label: t.Label, Budget: tierBudget, Error: "generation failed"}
+				resultCh <- tierResult{Tier: t.Name, Label: t.Label, Budget: tierBudget, Error: "generation failed"}
 				return
 			}
 
 			if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-				results[idx] = tierResult{Tier: t.Name, Label: t.Label, Budget: tierBudget, Error: "empty response"}
+				resultCh <- tierResult{Tier: t.Name, Label: t.Label, Budget: tierBudget, Error: "empty response"}
 				return
 			}
 
 			var text strings.Builder
 			for _, part := range resp.Candidates[0].Content.Parts {
-				if t, ok := part.(genai.Text); ok {
-					text.WriteString(string(t))
+				if tv, ok := part.(genai.Text); ok {
+					text.WriteString(string(tv))
 				}
 			}
 
@@ -2131,26 +2141,35 @@ Requirements:
 
 			var itin []types.DayPlan
 			if err := json.Unmarshal([]byte(jsonStr), &itin); err != nil {
-				results[idx] = tierResult{Tier: t.Name, Label: t.Label, Budget: tierBudget, Error: "parse failed"}
+				resultCh <- tierResult{Tier: t.Name, Label: t.Label, Budget: tierBudget, Error: "parse failed"}
 				return
 			}
 
-			results[idx] = tierResult{
+			resultCh <- tierResult{
 				Tier:      t.Name,
 				Label:     t.Label,
 				Itinerary: itin,
 				Budget:    tierBudget,
 			}
-		}(i, tier)
+		}(tier)
 	}
 
-	wg.Wait()
+	// Stream each tier result as an SSE event as soon as it's ready.
+	for i := 0; i < 3; i++ {
+		select {
+		case <-ctx.Done():
+			fmt.Fprintf(w, "event: error\ndata: {\"error\":\"timeout\"}\n\n")
+			flusher.Flush()
+			return
+		case result := <-resultCh:
+			data, _ := json.Marshal(result)
+			fmt.Fprintf(w, "event: tier\ndata: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"trip_id": tripID,
-		"tiers":   results,
-	})
+	fmt.Fprintf(w, "event: done\ndata: {\"trip_id\":\"%s\"}\n\n", tripID)
+	flusher.Flush()
 }
 
 // =====================================================
