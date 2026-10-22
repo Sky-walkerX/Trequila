@@ -35,13 +35,25 @@ func AllowPrivateFromEnv() bool {
 	return strings.EqualFold(os.Getenv("ALLOW_PRIVATE_PROVIDER_URLS"), "true")
 }
 
+// extraBlocked are ranges that are not caught by the standard "is this private" tests.
+// The IPv6 entries are transition mechanisms that embed an IPv4 address or route to one
+// (NAT64, 6to4, Teredo): reaching 64:ff9b::7f00:1 through a NAT64 gateway is reaching
+// 127.0.0.1. No legitimate LLM provider is addressed that way, so they are refused
+// outright rather than unwrapped.
 var extraBlocked = mustPrefixes(
-	"0.0.0.0/8",     // "this network"
-	"100.64.0.0/10", // carrier-grade NAT, used by some clouds for internal traffic
-	"192.0.0.0/24",  // IETF protocol assignments
-	"198.18.0.0/15", // benchmarking
-	"240.0.0.0/4",   // reserved
-	"2001:db8::/32", // documentation
+	"0.0.0.0/8",      // "this network"
+	"100.64.0.0/10",  // carrier-grade NAT, used by some clouds for internal traffic
+	"192.0.0.0/24",   // IETF protocol assignments
+	"192.88.99.0/24", // deprecated 6to4 relay anycast
+	"198.18.0.0/15",  // benchmarking
+	"240.0.0.0/4",    // reserved
+	"64:ff9b::/96",   // NAT64
+	"64:ff9b:1::/48", // local-use NAT64
+	"2002::/16",      // 6to4
+	"2001::/32",      // Teredo
+	"2001:db8::/32",  // documentation
+	"100::/64",       // discard-only
+	"fec0::/10",      // deprecated site-local
 )
 
 func mustPrefixes(cidrs ...string) []netip.Prefix {
@@ -55,6 +67,9 @@ func mustPrefixes(cidrs ...string) []netip.Prefix {
 // blocked reports whether ip is anything other than a public unicast address.
 func blocked(ip netip.Addr) bool {
 	ip = ip.Unmap() // ::ffff:10.0.0.1 is the private address 10.0.0.1
+	if !ip.IsGlobalUnicast() {
+		return true
+	}
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
 		return true
