@@ -1,0 +1,72 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+*.env
+
+# NATS credentials (sensitive!)
+*.creds
+trequila.creds
+
+# Go binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Go test binary
+*.test
+
+# Go coverage
+*.out
+coverage.txt
+coverage.html
+
+# Go vendor (uncomment if you don't commit vendor)
+# vendor/
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+
+# Docker
+.docker/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Debug
+debug
+*.debug
+
+# Local configuration
+local.yml
+local.yaml
+config.local.*
+.env
+trequila.creds
+# Stale prebuilt binary at the repo root only — must NOT match the cmd/monolith/ source dir
+/monolith
