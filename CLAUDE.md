@@ -29,8 +29,10 @@ go test ./internal/crypto -run TestEncryptDecryptRoundTrip -v   # single test
 go vet ./...
 gofmt -l .
 
+make env && make up                   # local stack: API + Postgres + NATS JetStream + Redis (docker compose)
+make check                            # gofmt + go vet + go test: what CI runs
+make help                             # logs, psql, down, reset, ...
 psql "$DATABASE_URL" -f init.sql      # canonical schema; migrations/ holds the incremental deltas
-docker compose up --build             # app only; NATS/Postgres/Redis come from env vars
 ```
 
 `go.mod` declares **go 1.25.5**; the local toolchain lives at `~/sdk/go` (already on PATH in `~/.zshrc`,
