@@ -66,7 +66,7 @@ func Connect(ctx context.Context, cfg Config) (*Bus, error) {
 			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			log.Info("nats reconnected", "url", nc.ConnectedUrl())
+			log.Info("nats reconnected", "url", nc.ConnectedUrlRedacted())
 		}),
 	}
 	switch {
