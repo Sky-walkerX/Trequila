@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -85,17 +85,17 @@ func (s *Service) GetCoordinates(city string) (float64, float64, error) {
 			var coords Coordinates
 			if json.Unmarshal([]byte(val), &coords) == nil {
 				if !coords.Found {
-					log.Printf("Cache HIT (Negative): %s is known to be invalid", city)
+					slog.Debug("geocode cache hit (negative)", "city", city)
 					return 0, 0, fmt.Errorf("location not found (cached)")
 				}
-				log.Printf("Cache HIT for coordinates: %s", city)
+				slog.Debug("geocode cache hit", "city", city)
 				metrics.CacheHitsTotal.WithLabelValues("geo_coords").Inc()
 				return coords.Lat, coords.Lon, nil
 			}
 		}
 	}
 
-	log.Printf("Cache MISS for coordinates: %s - fetching from API", city)
+	slog.Debug("geocode cache miss; fetching", "city", city)
 	metrics.CacheMissesTotal.WithLabelValues("geo_coords").Inc()
 
 	safeCity := url.QueryEscape(city)
@@ -124,7 +124,7 @@ func (s *Service) GetCoordinates(city string) (float64, float64, error) {
 
 	if len(result) == 0 {
 		if s.redis != nil {
-			log.Printf("Caching 'Not Found' for: %s", city)
+			slog.Debug("caching geocode not-found", "city", city)
 			data, _ := json.Marshal(Coordinates{Found: false})
 			s.redis.Set(ctx, cacheKey, data, 1*time.Hour)
 		}
@@ -156,14 +156,14 @@ func (s *Service) SearchPlaces(lat, lon float64, categories string, limit int) (
 		if err == nil {
 			var places []Place
 			if json.Unmarshal([]byte(val), &places) == nil {
-				log.Printf("Cache HIT for places: %s at (%.3f, %.3f)", categories, lat, lon)
+				slog.Debug("places cache hit", "categories", categories, "lat", lat, "lon", lon)
 				metrics.CacheHitsTotal.WithLabelValues("geo_places").Inc()
 				return places, nil
 			}
 		}
 	}
 
-	log.Printf("Cache MISS for places: %s - fetching from Overpass", categories)
+	slog.Debug("places cache miss; fetching from overpass", "categories", categories)
 	metrics.CacheMissesTotal.WithLabelValues("geo_places").Inc()
 
 	query := buildOverpassQuery(lat, lon, categories, limit)

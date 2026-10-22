@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -140,7 +140,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	if err := h.store.SaveConversation(saveCtx, conv); err != nil {
-		log.Printf("chatbot: failed to save conversation %s: %v", conv.ID, err)
+		slog.Error("chatbot: failed to save conversation", "conversation_id", conv.ID, "error", err)
 	}
 }
 

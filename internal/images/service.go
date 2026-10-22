@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -61,14 +61,14 @@ func (s *Service) GetImages(ctx context.Context, query string) ([]Image, error) 
 		if err == nil {
 			var images []Image
 			if json.Unmarshal([]byte(val), &images) == nil {
-				log.Println("Cache Hit for", query)
+				slog.Debug("images cache hit", "query", query)
 				metrics.CacheHitsTotal.WithLabelValues("images").Inc()
 				return images, nil
 			}
 		}
 	}
 
-	log.Println("Fetching images for", query)
+	slog.Debug("fetching images", "query", query)
 	metrics.CacheMissesTotal.WithLabelValues("images").Inc()
 
 	var images []Image

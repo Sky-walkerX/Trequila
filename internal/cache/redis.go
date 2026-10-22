@@ -5,7 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -50,7 +50,7 @@ func RootCAs() *x509.CertPool {
 	if !strings.Contains(raw, "-----BEGIN") {
 		decoded, err := base64.StdEncoding.DecodeString(raw)
 		if err != nil {
-			log.Printf("⚠️  REDIS_TLS_CA_CERT is neither PEM nor valid base64; ignoring it: %v", err)
+			slog.Warn("REDIS_TLS_CA_CERT is neither PEM nor valid base64; ignoring it", "error", err)
 			return nil
 		}
 		pem = decoded
@@ -60,7 +60,7 @@ func RootCAs() *x509.CertPool {
 	if !pool.AppendCertsFromPEM(pem) {
 		// Falling back to the system roots here would be a silent downgrade to a
 		// connection that cannot verify, so say so loudly.
-		log.Printf("⚠️  REDIS_TLS_CA_CERT contained no usable certificate; ignoring it")
+		slog.Warn("REDIS_TLS_CA_CERT contained no usable certificate; ignoring it")
 		return nil
 	}
 	return pool
@@ -92,7 +92,7 @@ func NewRedisClient(redisURL string) *redis.Client {
 	}
 	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
-		log.Printf("Failed to parse Redis URL, using as address: %v", err)
+		slog.Warn("could not parse REDIS_URL; using it as a plain address", "error", err)
 		return redis.NewClient(&redis.Options{Addr: redisURL})
 	}
 	if strings.HasPrefix(redisURL, "rediss://") {
@@ -104,13 +104,13 @@ func NewRedisClient(redisURL string) *redis.Client {
 		if InsecureSkipVerify() {
 			cfg.InsecureSkipVerify = true
 			warnOnce.Do(func() {
-				log.Printf("⚠️  Redis TLS certificate verification is DISABLED (REDIS_TLS_INSECURE_SKIP_VERIFY). " +
-					"Traffic is encrypted, but the server's identity is not checked. " +
-					"Prefer REDIS_TLS_CA_CERT, which keeps verification on.")
+				slog.Warn("Redis TLS certificate verification is DISABLED (REDIS_TLS_INSECURE_SKIP_VERIFY): " +
+					"traffic is encrypted but the server's identity is not checked; " +
+					"prefer REDIS_TLS_CA_CERT, which keeps verification on")
 			})
 		} else if cfg.RootCAs != nil {
 			warnOnce.Do(func() {
-				log.Printf("Redis TLS: verifying against the pinned authority in REDIS_TLS_CA_CERT (server name %q)", cfg.ServerName)
+				slog.Info("redis tls: verifying against the pinned authority", "server_name", cfg.ServerName)
 			})
 		}
 		opt.TLSConfig = cfg

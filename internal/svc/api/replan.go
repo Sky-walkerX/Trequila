@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -212,7 +211,7 @@ Return a JSON array of replanned day objects.`, destination, string(daysJSON), w
 
 	jsonStr, err := llmProvider.GenerateJSON(ctx, prompt)
 	if err != nil {
-		log.Printf("Replan: Provider error: %v", err)
+		s.log.Warn("replan: provider error", "trip_id", tripID, "error", err)
 		http.Error(w, `{"error":"failed to generate alternatives"}`, http.StatusInternalServerError)
 		return
 	}
@@ -226,7 +225,7 @@ Return a JSON array of replanned day objects.`, destination, string(daysJSON), w
 
 	var replannedDays []types.DayPlan
 	if err := json.Unmarshal([]byte(jsonStr), &replannedDays); err != nil {
-		log.Printf("Replan: Parse error: %v", err)
+		s.log.Warn("replan: could not parse the model output", "trip_id", tripID, "error", err)
 		http.Error(w, `{"error":"failed to parse replanned itinerary"}`, http.StatusInternalServerError)
 		return
 	}
