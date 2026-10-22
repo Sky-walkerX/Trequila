@@ -30,7 +30,9 @@ go vet ./...
 gofmt -l .
 
 make env && make up                   # local stack: API + Postgres + NATS JetStream + Redis (docker compose)
-make check                            # gofmt + go vet + go test: what CI runs
+make check                            # gofmt + go vet + go test (no services needed)
+make test-int                         # the same plus the Postgres-backed tests (starts the db service)
+golangci-lint run ./...               # the CI linter (config in .golangci.yml)
 make help                             # logs, psql, down, reset, ...
 psql "$DATABASE_URL" -f init.sql      # canonical schema; migrations/ holds the incremental deltas
 ```
@@ -44,62 +46,67 @@ currently go1.26.4). Docker fallback if the local toolchain is missing:
 HTTP parsing against `httptest` servers, `cmd/monolith` key handlers and SSE completion logic). Rely on `go build` / `go vet`
 elsewhere rather than adding broad test scaffolding.
 
-`init.sql` is the source of truth for schema and is **not** applied automatically at startup;
-`migrations/` holds the incremental deltas for existing databases (run them after deploying the matching
-binary).
+Schema changes are goose migrations in `migrations/` (`NNNNN_name.sql` with `-- +goose Up/Down`). The
+`migrate` binary applies them (`make up` runs it as a one-shot service; Heroku runs it in the release phase).
+Every migration needs a working `Down`: CI applies, resets and re-applies them.
 
-## Architecture: monolith of in-process "microservices"
+**Tests.** `go test ./...` needs no services: tests that need Postgres skip unless `TEST_DATABASE_URL` is set
+(`make test-int` sets it from the compose database; CI always sets it). Each such test gets its own throwaway
+schema from `internal/testdb`. Tests cover tricky or security-critical logic and the event flows end to end
+(`internal/svc/e2e_test.go` runs the real services on the in-memory bus); do not mock Postgres.
 
-Everything runs in **one binary** (`cmd/monolith/main.go`, ~1,970 lines — all HTTP handlers plus worker
-bootstrap live there). The HTTP server and the workers run as goroutines and communicate **only through an
-external NATS JetStream stream named `TRIPS`** (subjects `trips.*`, file storage, 7-day retention, created
-idempotently in `internal/nats`). There is no in-process call between the API and the workers — the message
-bus is the integration point, so the same code could be split into separate deployables unchanged.
+## Architecture: five services in one binary
+
+`cmd/monolith` is wiring only. It builds five services under `internal/svc` — **api** (HTTP, accounts, trips,
+keys, the progress stream; owns the `trips` data), **planner** (itinerary from the user's LLM key),
+**discovery** (places and images), **router** (orders each day) and **agent** (`/mcp` and `/api/chat`) — and
+runs them as goroutines. They never import each other. They communicate through `internal/bus`, a
+transport-neutral event contract with a NATS JetStream adapter (`natsbus`, stream `TRIPS`, subjects `trips.*`)
+and an in-memory one for tests. Each service exposes `Routes(mux)` and/or `Subscriptions()`. The reasoning is in
+`docs/adr/` — read ADRs 001–004 before changing how services or events work.
+
+Delivery is **at least once**. A handler returning an error is redelivered (up to `MaxDeliver`); wrap an error
+with `bus.Permanent` when redelivery cannot fix it. Handlers must therefore be idempotent.
 
 ### Async trip flow (the core path)
 
-1. `POST /api/trips` resolves the caller's provider key (`providerkeys.Store.Resolve`), **snapshots
-   `{provider, model}` onto the `trips` row**, inserts with `status='pending'`, and publishes
-   `trips.requested` (deduplicated by `request_id` via `WithMsgID`).
-2. Three workers fan out on `trips.requested`:
-   - **Planner** (`internal/planner`) → re-resolves the user's key at processing time → `LLMProvider.GenerateItinerary` → publishes `trips.itinerary`.
-   - **Imager** (`internal/images`) → Wikipedia REST summary (hero) + Openverse (gallery) → `trips.images`.
-   - **Places** (`internal/geo`) → OSM Nominatim geocode + Overpass POIs → `trips.places`.
-3. **Five consumer goroutines** in `main.go` (`consumeItineraries`/`consumeImages`/`consumePlaces`/
-   `consumeRoutes`/`consumeFailures`) subscribe to those result subjects and persist each into
-   the matching JSONB column of `trips`. Itinerary arrival flips `status='completed'`; `trips.failed` sets
-   `status='failed'` + `error_reason`.
-4. **Route** (`internal/route`) triggers on `trips.route_requested`, which `consumeItineraries` publishes
-   once the itinerary is stored, and which `POST /api/trips/optimize/{id}` republishes on demand. The worker
-   holds **no database**: the request carries the itinerary, destination and the trip's already-found places,
-   and anything still unplaced is geocoded through the shared `geo.Service` (Redis-cached, ~1 lookup/second).
-   It orders each day — clock order when the activities carry times, otherwise nearest-neighbour + 2-opt on
-   haversine distance — and publishes `trips.route`. Distances are **straight-line × 1.25**, not street
-   routing; that is a deliberate trade to keep a routing provider off the trip-planning path.
-5. Client reads progress via SSE at `GET /api/trips/stream/{id}`: emit whatever is already in the DB, then
-   live-subscribe to `trips.>` and forward `images`/`places`/`itinerary`/`route`/`failed` events until the
-   itinerary and the places have both arrived (`streamProgress` in `cmd/monolith/stream_progress.go`;
-   `streamPlacesGrace` 30s after the itinerary if places never arrive, `streamHardTimeout` 5-min cap).
-   A `: keepalive` comment goes out every `streamHeartbeatInterval` (20s) — **do not remove it**: Heroku's
-   router kills a response that sends nothing for ~55s with `H15 desc="Idle connection"`, and stages are
-   routinely more than a minute apart.
+1. `POST /api/trips` → `trips.Store.Create` (shared with the MCP `create_trip` tool): validates, resolves the
+   caller's provider key, and in **one transaction** inserts the trip (`status='pending'`, `{provider, model}`
+   snapshotted), the owner's `trip_members` row, an `idempotency_keys` row when `Idempotency-Key` is sent, and
+   a `trips.requested` event in the **outbox**. After the commit the relay publishes it immediately; a 10-second
+   sweep (`outbox.Relay.Run`) recovers anything a crash or broker outage left behind.
+2. Three subscriptions react to `trips.requested`:
+   - **planner** (`planner-v4`) → re-resolves the key → `LLMProvider.GenerateItinerary` → `trips.itinerary`.
+     A missing key or an auth/billing error publishes `trips.failed` and returns `bus.Permanent`; other
+     errors are retried.
+   - **discovery** `places-v4` → Nominatim geocode + Overpass → `trips.places` (a destination that cannot be
+     geocoded publishes empty places; all three lookups failing is retried).
+   - **discovery** `images-v4` → Wikipedia + Openverse → `trips.images`.
+3. The API consumes the results (`api-*-v4`, each wrapped by `inbox.Handle`): in one transaction it updates the
+   `trips` column, **appends a `trip_events` row** (what the stream replays) and, for the itinerary, adds a
+   `trips.route_requested` outbox event carrying the trip's places. Itinerary arrival sets
+   `status='completed'`; `trips.failed` sets `status='failed'` + `error_reason`.
+4. **router** (`route-v4`) holds **no database**: the request carries itinerary, destination and places; whatever
+   is still unplaced is geocoded through `geo.Service` within a 3-minute budget. It orders each day (clock order
+   when activities carry times, otherwise nearest-neighbour + 2-opt on haversine distance) and publishes
+   `trips.route`. Distances are **straight-line × 1.25**, a deliberate trade to keep a routing provider off the
+   planning path. `POST /api/trips/optimize/{id}` queues a fresh request with a new event ID.
+5. `GET /api/trips/stream/{id}` serves `trip_events` as SSE (ADR 004): the handler registers a `tripevents.Hub`
+   doorbell **before** replaying, sends each event with `id:` = the row ID, honours `Last-Event-ID`, and ends on
+   `failed`, on itinerary + places (`streamProgress`), or `streamPlacesGrace` (30s) after the itinerary if
+   places never arrive, with a 5-minute hard cap. A `: keepalive` comment goes out every 20s — **do not remove
+   it**: Heroku's router kills a response that sends nothing for ~55s (`H15`), and the frontend must skip the
+   empty-data frame it produces.
 
-   **Completion is deliberately not gated on `trips.route`.** Routing only starts once the itinerary is
-   stored and then geocodes at about one lookup a second, so it frequently lands after the stream has
-   finished; `GET /api/trips/{id}` serves it in that case. Note that a `: keepalive` comment reaches
-   `@microsoft/fetch-event-source`'s `onmessage` with an **empty data buffer** — the frontend must skip
-   those rather than parse them.
+   **Completion is deliberately not gated on `trips.route`**; it often lands after the stream ends and
+   `GET /api/trips/{id}` serves it then.
+6. A background job in the API fails trips still `pending` after 10 minutes (an event that exhausted its
+   deliveries leaves no failure behind), and purges old outbox and processed-event rows.
 
-   The places worker Naks (JetStream redelivers) when an Overpass lookup fails and publishes `trips.places`
-   only on success; it never publishes `trips.failed`. If places never arrive, the stream still completes
-   with partial data once `streamPlacesGrace` expires after the itinerary.
-
-**Producers vs. consumers:** producer workers generate and publish; consumer goroutines only persist. Each
-is a durable JetStream consumer with a distinct, **version-suffixed `Durable` name**
-(`planner-durable-v3`, `imager-worker-v1`, `places-worker-v2`, `route-worker-v1`,
-`api-itinerary-writer-v1`, `api-route-writer-v1`, `api-failures-writer-v1`, …). **Bump the version suffix**
-whenever you change a consumer's `FilterSubject` or config — JetStream will not otherwise reset existing
-consumer state.
+**Event IDs are deterministic** where one input yields one output (`events.ID(type, tripID)`), which is what
+lets the broker's de-duplication window, the outbox's unique key and the inbox ledger agree. **Durable names are
+version-suffixed** (`planner-v4`, …): bump the suffix whenever you change a subscription's type or config, or
+JetStream keeps the old consumer state.
 
 ### BYOK: keys, providers, factory
 
@@ -134,7 +141,7 @@ consumer state.
   from the chat loop specifically to limit prompt-injection blast radius — they stay available on `/mcp`,
   which is driven by an explicit client. Keep that list in mind when adding destructive tools.
 
-### Synchronous LLM features (bypass NATS)
+### Synchronous LLM features (bypass the bus)
 
 The weather replan resolves the user's key and calls the provider inside the HTTP handler (to be replaced
 by an async `weather_replan` edit in Phase 5):
@@ -145,10 +152,18 @@ by an async `weather_replan` edit in Phase 5):
 ## Conventions and gotchas
 
 - **Failure model:** on LLM error, check `ai.IsAuthError` **before** `ai.IsRetryable` — auth/credit failures
-  must fail fast (no retry), publish `trips.failed` with a reason, and surface as an SSE `failed` event.
-- **AckWait must exceed the worst-case processing time** of the handler, or JetStream redelivers
+  must fail fast: publish `trips.failed` with a reason and return `bus.Permanent`; they surface as an SSE
+  `failed` event. Errors that may clear up (an outage, a timeout) are returned plainly and retried.
+- **AckWait must exceed the worst-case processing time** of the handler, or the broker redelivers
   mid-flight: 2 min for the planner, 5 min for places (three sequential Overpass queries), 5 min for route
-  (bounded by its own 3-min geocode budget). The five `api-*-writer` consumers are 30s each.
+  (bounded by its own 3-min geocode budget). The five `api-*` result consumers are 30s each.
+- **Provider base URLs are an SSRF surface.** `base_url` on an OpenAI-compatible key is user-chosen and the
+  server calls it. `netguard.ValidateBaseURL` rejects non-https and internal hosts on save, and
+  `netguard.Transport` (used by the OpenAI adapter) refuses to *connect* to non-public addresses, which also
+  covers DNS rebinding and redirects. Operators who run a model on their own network opt in with
+  `ALLOW_PRIVATE_PROVIDER_URLS=true`. Never return an upstream's response or error text to the caller.
+- **Logging** is `log/slog` (`internal/logging`, `LOG_LEVEL`, `LOG_FORMAT`). Log with attributes (`"trip_id", id`),
+  never string-built messages, and never log keys or tokens.
 - **The HTTP server sets no `WriteTimeout`** (`ReadHeaderTimeout` guards the handshake instead). WriteTimeout
   is absolute from the start of the response, so *any* value caps SSE duration; each streaming handler
   enforces its own deadline.
@@ -182,15 +197,17 @@ by an async `weather_replan` edit in Phase 5):
   `https://trequila.namankhandelwal.dev`. `FRONTEND_URL` (same default) is where the OAuth callback
   redirects. Rate limiting is per-IP at 10 req/s burst 20, and `X-Forwarded-For`/`X-Real-IP` are honored
   **only** when `RemoteAddr` is a loopback/private/link-local address.
-- **Config** (`loadConfig` in `main.go`): `DATABASE_URL`, `REDIS_URL`, `NATS_URL`, `JWT_SECRET`, and
+- **Config** (`internal/config`): `DATABASE_URL`, `REDIS_URL`, `NATS_URL`, `JWT_SECRET`, and
   `ENCRYPTION_KEY` are the real requirements; `JWT_SECRET` is validated in `auth.NewAuthService`, not in
-  `loadConfig`. There are **no operator LLM keys** — anything reintroducing one is a regression.
-- **Deployment** targets Heroku (`Procfile`, `app.json`, `heroku/go` buildpack); NATS credentials come from
-  a file (`NATS_CREDS_FILE`, local) or inline content (`NATS_CREDS`, Heroku). `ENABLE_KEEP_ALIVE=true`
-  self-pings `/ping` every 25 min.
-- **Observability**: Prometheus at `/metrics` (`internal/metrics`); `/ping` is a DB-free liveness check,
-  `/health` checks DB + NATS. `TripsCompletedTotal` and `TripsFailedTotal` are wired in the consumers.
-- **`API_DOCUMENTATION.md` is the authoritative HTTP reference** and now matches `setupRoutes`. Update it
+  `config.Load`. There are **no operator LLM keys** — anything reintroducing one is a regression.
+- **Deployment** targets Heroku today (`Procfile` runs `bin/migrate up` in the release phase, `app.json`,
+  `heroku/go` buildpack); NATS credentials come from a file (`NATS_CREDS_FILE`, local) or inline content
+  (`NATS_CREDS`). `ENABLE_KEEP_ALIVE=true` self-pings `/ping` every 25 min. The Dockerfile builds both
+  `monolith` and `migrate`.
+- **Observability**: Prometheus metrics (`internal/metrics`) are served at `/metrics` **only** when
+  `METRICS_TOKEN` is set, and then behind that bearer token. `/ping` is a DB-free liveness check, `/health`
+  checks DB + the bus. Bus deliveries, outbox backlog and trip counters are exported.
+- **`API_DOCUMENTATION.md` is the authoritative HTTP reference** and matches `api.Service.Routes`. Update it
   in the same change whenever you add, remove, or reshape a route.
 - **Commits must NOT include `Co-Authored-By: Claude` or any AI-attribution** (user preference).
 
@@ -202,8 +219,7 @@ The BYOK pivot (spec §13) is complete through step 11 and merged to `main`. Ope
   cross-origin XHR when the API and frontend share a registrable domain. If the API is deployed somewhere
   like `*.herokuapp.com`, the frontend must use the `Authorization` header.
 - `/api/keys` returns `200` with an empty body on upsert/delete; a JSON body would be friendlier.
-- **Before public release the owner must (a) rotate the Gemini key leaked on `origin/dev`, and (b) delete
-  the stale remote branches `dev`, `critical`.** `main` was reset to a single clean root commit (`08a2b03`)
-  to purge a leaked `.env`; old history survives locally on `dev` and the `backup/*-pre-oss-reset` tags.
+- **Before public release the owner must rotate the Gemini key that leaked on the old `origin/dev` branch.**
+  The branch has been deleted and `main` rewritten, but deleting a branch does not revoke a key.
 - **Local LLMs (Ollama / LM Studio) are deferred to v2** — a server cannot reach a user's localhost, so that
   path must be client-side. Don't add server-side local-LLM support without revisiting the spec.

@@ -23,7 +23,8 @@ git clone https://github.com/Sky-walkerX/Trequila.git && cd Trequila
 make env      # .env with generated local secrets (never committed)
 make up       # API + Postgres + NATS JetStream + Redis on localhost
 make logs     # follow the API
-make check    # gofmt + go vet + go test
+make check    # gofmt + go vet + go test (Postgres-backed tests skip)
+make test-int # everything, including the tests that need Postgres
 ```
 
 Run the API from your editor instead of the container by starting only the dependencies
@@ -38,12 +39,14 @@ Postgres password is `POSTGRES_PASSWORD` in your `.env`.
 
 1. Branch from `main`: `git switch -c fix/short-description`.
 2. Keep the change focused. Unrelated cleanup belongs in its own pull request.
-3. Add or update tests where the logic is non-trivial. Tests here are deliberately light: they cover tricky
-   or security-critical pure logic and HTTP parsing against `httptest` servers. They must not need external
-   services.
+3. Add or update tests for the behaviour you change, and watch a new test fail before you make it pass. Use
+   real Postgres through `internal/testdb` (each test gets a throwaway schema; it skips when
+   `TEST_DATABASE_URL` is unset) rather than mocking the database, and the in-memory bus
+   (`internal/bus/memory`) instead of a broker.
 4. Update [`API_DOCUMENTATION.md`](API_DOCUMENTATION.md) in the same change when a route is added, removed or
    reshaped.
-5. Run `make check`. CI runs the same.
+5. Run `make test-int` and `golangci-lint run`. CI runs both, with the race detector, and also applies and
+   rolls back every migration.
 6. Open a pull request describing what changed and why, and how you verified it.
 
 ### Commit messages
@@ -62,6 +65,9 @@ fix(stream): complete the SSE stream when places never arrive
 - Prefer the standard library. Add a dependency only when it clearly earns its place, and say why in the pull
   request.
 - Construct LLM providers through `internal/llm.NewProvider` and `Close()` every one you create.
+- Schema changes are goose migrations in `migrations/` with a working `Down`; never edit one that has shipped.
+- Event handlers are delivered at least once, so make them idempotent; read ADRs 001-004 in `docs/adr` first.
+- Anything that takes a URL from a user goes through `internal/netguard`.
 - Never log or return a plaintext API key. Keys exist in memory only, and are stored encrypted.
 - Do not weaken the startup checks on `JWT_SECRET` and `ENCRYPTION_KEY`.
 - Handle errors explicitly. A swallowed error that turns into a `null` column is a bug here.

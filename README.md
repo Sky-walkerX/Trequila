@@ -57,28 +57,31 @@ reference is [`API_DOCUMENTATION.md`](API_DOCUMENTATION.md).
 
 ## Architecture
 
-One Go binary runs the HTTP API and the workers as goroutines. They talk only through a NATS JetStream
-stream (`TRIPS`), so each worker can later be deployed on its own.
+One Go binary runs five services as goroutines: **api**, **planner**, **discovery**, **router** and **agent**
+(MCP and chat). They never call each other; they exchange events over a transport-neutral bus (NATS JetStream
+today), so any of them can be deployed on its own later.
 
 ```mermaid
 flowchart LR
-    client([Client]) -->|POST /api/trips| api[API]
-    api -->|trips.requested| bus[(NATS JetStream)]
-    bus --> planner[Planner<br/>your LLM key]
-    bus --> places[Places<br/>OSM]
-    bus --> images[Images<br/>Wikipedia, Openverse]
+    client([Client]) -->|POST /api/trips| api[api]
+    api -->|"one transaction:<br/>trip + outbox event"| pg[(Postgres)]
+    pg -. outbox relay .-> bus[(Event bus<br/>NATS JetStream)]
+    bus -->|trips.requested| planner[planner<br/>your LLM key]
+    bus -->|trips.requested| discovery[discovery<br/>OSM, Wikipedia]
     planner -->|trips.itinerary| bus
-    places -->|trips.places| bus
-    images -->|trips.images| bus
-    bus -->|trips.route_requested| route[Route]
-    route -->|trips.route| bus
-    bus -->|consumers| api
-    api --> pg[(Postgres)]
-    api -. cache .-> redis[(Redis)]
-    api ==>|SSE| client
+    discovery -->|places, images| bus
+    bus -->|results| api
+    api -->|route request via outbox| bus
+    bus --> router[router]
+    router -->|trips.route| bus
+    api -->|"trip_events + LISTEN/NOTIFY"| pg
+    pg ==>|SSE with Last-Event-ID| client
 ```
 
-More detail, conventions and gotchas for contributors are in [`CLAUDE.md`](CLAUDE.md).
+Reliability comes from three patterns: a **transactional outbox** (an event is never lost between "saved" and
+"published"), **idempotent consumers** (a redelivered event changes nothing), and a **durable event log** behind
+the progress stream (a reconnecting client resumes exactly where it left off). The reasoning is written up in
+[`docs/adr`](docs/adr). Conventions and gotchas for contributors are in [`CLAUDE.md`](CLAUDE.md).
 
 ## Configuration
 
@@ -92,6 +95,9 @@ More detail, conventions and gotchas for contributors are in [`CLAUDE.md`](CLAUD
 | `JWT_SECRET` | yes | JWT signing key, at least 32 bytes; the server refuses to start otherwise |
 | `ENCRYPTION_KEY` | yes | 32-byte base64 key for AES-256-GCM. **Losing it makes every stored user key unreadable** |
 | `CORS_ALLOWED_ORIGINS` | no | Comma-separated browser origins allowed to call the API |
+| `LOG_LEVEL`, `LOG_FORMAT` | no | `debug`/`info`/`warn`/`error`; `json` or `text` (default: text on a terminal, JSON otherwise) |
+| `METRICS_TOKEN` | no | Serves Prometheus metrics at `/metrics` behind this bearer token. Without it the endpoint is off |
+| `ALLOW_PRIVATE_PROVIDER_URLS` | no | `true` lets an OpenAI-compatible key point at a private address, for a model on your own network. Off by default (SSRF protection) |
 | `FRONTEND_URL` | no | Where the Google OAuth callback redirects |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL` | no | Enable Google sign-in |
 | `OSM_NOMINATIM_URL`, `OSM_OVERPASS_URL`, `WIKIPEDIA_API_URL`, `OPENVERSE_API_URL`, `HTTP_USER_AGENT` | no | Point enrichment at your own mirrors |
@@ -101,11 +107,14 @@ More detail, conventions and gotchas for contributors are in [`CLAUDE.md`](CLAUD
 ## Development
 
 ```bash
-make check          # gofmt, go vet and the test suite: what CI runs
+make check          # gofmt, go vet and the test suite (no services needed)
+make test-int       # the same plus the Postgres-backed tests (starts the db service)
+golangci-lint run   # the CI linter
 go test ./internal/crypto -run TestEncryptDecryptRoundTrip -v   # one test
 ```
 
-The test suite needs no external services. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow.
+Tests that need Postgres skip themselves unless `TEST_DATABASE_URL` is set; each gets its own throwaway schema.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow.
 
 ## Security
 

@@ -208,3 +208,18 @@ Create the packages beside the old code; nothing is wired yet.
 - `make check`, `make test-int`, `docker compose up --build` + the README quickstart (register → key → trip →
   SSE reaches `failed` with a fake key), `migrate down` then `up` on the compose database.
 - Final whole-branch review; push `main`.
+
+## Outcome
+
+Phase 1 shipped as planned, with these differences:
+
+- **Hardening added.** Reviews of the ported code found a server-side request forgery path (user-chosen provider
+  base URLs), a public `/metrics` endpoint and verbose error responses; they were fixed in this phase
+  (`internal/netguard`, `METRICS_TOKEN`, sanitised handlers).
+- **A stuck-trip reaper** (not in the original plan) fails trips with no itinerary after ten minutes, because an
+  event that exhausts its deliveries leaves no failure behind.
+- **Several tests that had never run** (they were gated on `DATABASE_URL`) were moved onto `internal/testdb`; two
+  had stale expectations and were corrected.
+- **Lint.** `golangci-lint` is part of CI; the real findings (an ignored `UPDATE`, ignored decode errors, an
+  unparseable-coordinates bug) were fixed and the conventional best-effort calls are excluded with reasons in
+  `.golangci.yml`.
