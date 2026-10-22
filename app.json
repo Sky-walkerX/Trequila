@@ -1,0 +1,61 @@
+{
+  "name": "Trequila",
+  "description": "Open-source BYOK trip planning API with real-time updates",
+  "keywords": ["go", "travel", "ai", "api"],
+  "website": "https://github.com/sky-walkerx/trequila",
+  "repository": "https://github.com/sky-walkerx/trequila",
+  "stack": "heroku-24",
+  "buildpacks": [
+    {
+      "url": "heroku/go"
+    }
+  ],
+  "env": {
+    "NATS_URL": {
+      "description": "NATS JetStream URL (use Synadia NGS or similar)",
+      "required": true
+    },
+    "JWT_SECRET": {
+      "description": "Secret key for JWT signing (must be at least 32 bytes)",
+      "generator": "secret"
+    },
+    "ENCRYPTION_KEY": {
+      "description": "32-byte base64 encoded master key for AES-256-GCM encryption of user API keys. Generate via: openssl rand -base64 32",
+      "required": true
+    },
+    "GOOGLE_CLIENT_ID": {
+      "description": "Google OAuth Client ID (optional)",
+      "required": false
+    },
+    "GOOGLE_CLIENT_SECRET": {
+      "description": "Google OAuth Client Secret (optional)",
+      "required": false
+    },
+    "GOOGLE_REDIRECT_URL": {
+      "description": "Google OAuth Redirect URL",
+      "required": false
+    },
+    "CORS_ALLOWED_ORIGINS": {
+      "description": "Comma-separated list of frontend origins allowed by CORS. Defaults to https://trequila.namankhandelwal.dev",
+      "required": false
+    },
+    "FRONTEND_URL": {
+      "description": "Base URL the OAuth callback redirects the browser back to. Defaults to https://trequila.namankhandelwal.dev",
+      "required": false
+    }
+  },
+  "addons": [
+    {
+      "plan": "heroku-postgresql:essential-0"
+    },
+    {
+      "plan": "heroku-redis:mini"
+    }
+  ],
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  }
+}
