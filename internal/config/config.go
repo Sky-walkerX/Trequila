@@ -23,6 +23,8 @@ type Config struct {
 
 	LogLevel  string
 	LogFormat string
+
+	MetricsToken string // bearer token for /metrics; empty disables the endpoint
 }
 
 // Load reads the environment. JWT_SECRET is validated by the auth service and
@@ -41,6 +43,8 @@ func Load() Config {
 
 		LogLevel:  os.Getenv("LOG_LEVEL"),
 		LogFormat: os.Getenv("LOG_FORMAT"),
+
+		MetricsToken: os.Getenv("METRICS_TOKEN"),
 	}
 }
 

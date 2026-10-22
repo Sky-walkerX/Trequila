@@ -6,9 +6,11 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,19 +35,24 @@ type Deps struct {
 	Pinger      bus.Pinger // optional; reported by /health
 	FrontendURL string
 	Log         *slog.Logger
+
+	// MetricsToken protects /metrics. When empty the endpoint is not served at all:
+	// request counts and route names are not for the public internet.
+	MetricsToken string
 }
 
 // Service implements the API.
 type Service struct {
-	db          *sql.DB
-	auth        *auth.AuthService
-	keys        *providerkeys.Store
-	trips       *trips.Store
-	hub         *tripevents.Hub
-	relay       *outbox.Relay
-	pinger      bus.Pinger
-	frontendURL string
-	log         *slog.Logger
+	db           *sql.DB
+	auth         *auth.AuthService
+	keys         *providerkeys.Store
+	trips        *trips.Store
+	hub          *tripevents.Hub
+	relay        *outbox.Relay
+	pinger       bus.Pinger
+	frontendURL  string
+	log          *slog.Logger
+	metricsToken string
 
 	// Stream timings; fields so tests can shorten them.
 	streamHeartbeat   time.Duration
@@ -71,7 +78,7 @@ func New(d Deps) *Service {
 	}
 	return &Service{
 		db: d.DB, auth: d.Auth, keys: d.Keys, trips: d.Trips, hub: d.Hub, relay: d.Relay,
-		pinger: d.Pinger, frontendURL: d.FrontendURL, log: log,
+		pinger: d.Pinger, frontendURL: d.FrontendURL, log: log, metricsToken: d.MetricsToken,
 		streamHeartbeat:   defaultStreamHeartbeat,
 		streamHardTimeout: defaultStreamHardTimeout,
 		streamPlacesGrace: defaultStreamPlacesGrace,
@@ -83,7 +90,7 @@ func (s *Service) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/ping", s.handlePing)
 	mux.HandleFunc("/health", s.handleHealth)
-	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/metrics", s.metricsHandler())
 
 	mux.HandleFunc("/auth/register", s.handleRegister)
 	mux.HandleFunc("/auth/login", s.handleLogin)
@@ -134,4 +141,23 @@ func (s *Service) purgeLoop(ctx context.Context) {
 		case <-t.C:
 		}
 	}
+}
+
+// metricsHandler serves Prometheus metrics to a caller presenting the configured bearer
+// token, and 404s when no token is configured.
+func (s *Service) metricsHandler() http.Handler {
+	if s.metricsToken == "" {
+		return http.NotFoundHandler()
+	}
+	want := []byte(s.metricsToken)
+	prom := promhttp.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := []byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if subtle.ConstantTimeCompare(got, want) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		prom.ServeHTTP(w, r)
+	})
 }

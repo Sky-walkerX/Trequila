@@ -442,3 +442,41 @@ func TestStuckPendingTripsAreFailedAndAnnounced(t *testing.T) {
 		t.Errorf("stream of the reaped trip = %s", names(evs))
 	}
 }
+
+func TestMetricsAreOffUnlessATokenIsConfiguredAndThenRequireIt(t *testing.T) {
+	h := newHarness(t)
+	get := func(token string) int {
+		req, _ := http.NewRequest("GET", h.srv.URL+"/metrics", nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get(""); got != http.StatusNotFound {
+		t.Errorf("without METRICS_TOKEN configured, /metrics = %d, want 404", got)
+	}
+
+	// Rebuild the routes with a token.
+	h.svc.metricsToken = "s3cret-scrape-token"
+	mux := http.NewServeMux()
+	h.svc.Routes(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	h.srv = srv
+
+	if got := get(""); got != http.StatusUnauthorized {
+		t.Errorf("no token = %d, want 401", got)
+	}
+	if got := get("wrong"); got != http.StatusUnauthorized {
+		t.Errorf("wrong token = %d, want 401", got)
+	}
+	if got := get("s3cret-scrape-token"); got != http.StatusOK {
+		t.Errorf("right token = %d, want 200", got)
+	}
+}

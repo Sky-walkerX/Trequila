@@ -86,7 +86,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 	// Services.
 	apiSvc := api.New(api.Deps{
 		DB: db, Auth: authSvc, Keys: keys, Trips: tripStore, Hub: hub, Relay: relay,
-		Pinger: nb, FrontendURL: cfg.FrontendURL, Log: log,
+		Pinger: nb, FrontendURL: cfg.FrontendURL, Log: log, MetricsToken: cfg.MetricsToken,
 	})
 	agentSvc := agent.New(agent.Deps{DB: db, Auth: authSvc, Keys: keys, Trips: tripStore, Geo: geoSvc, Images: imgSvc})
 
