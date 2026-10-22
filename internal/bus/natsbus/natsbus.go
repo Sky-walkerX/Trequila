@@ -215,8 +215,7 @@ func (b *Bus) deliver(ctx context.Context, s bus.Subscription, ackWait time.Dura
 	case err == nil:
 		msg.Ack()
 	case bus.IsPermanent(err):
-		b.log.Warn("dropping event", "durable", s.Durable, "event_id", e.ID, "error", err)
-		msg.Ack()
+		msg.Ack() // redelivery cannot fix it; the logging middleware has already recorded why
 	default:
 		msg.NakWithDelay(b.retry)
 	}

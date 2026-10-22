@@ -9,11 +9,13 @@ import (
 	"database/sql"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sky-walkerx/trequila/internal/auth"
 	"github.com/sky-walkerx/trequila/internal/bus"
+	"github.com/sky-walkerx/trequila/internal/inbox"
 	"github.com/sky-walkerx/trequila/internal/outbox"
 	"github.com/sky-walkerx/trequila/internal/providerkeys"
 	"github.com/sky-walkerx/trequila/internal/tripevents"
@@ -101,7 +103,35 @@ func (s *Service) Routes(mux *http.ServeMux) {
 	mux.Handle("/api/keys/", protected(http.HandlerFunc(s.handleKeyByProvider)))
 }
 
-// Run starts the service's background jobs and blocks until ctx is cancelled.
+// Run starts the service's background jobs and blocks until ctx is cancelled:
+// failing trips that never got an itinerary, and forgetting old processed-event
+// markers.
 func (s *Service) Run(ctx context.Context) {
-	s.reapLoop(ctx)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); s.reapLoop(ctx) }()
+	go func() { defer wg.Done(); s.purgeLoop(ctx) }()
+	wg.Wait()
+}
+
+// processedEventsRetention must stay well above the broker's redelivery horizon.
+const processedEventsRetention = 14 * 24 * time.Hour
+
+func (s *Service) purgeLoop(ctx context.Context) {
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		if n, err := inbox.Purge(ctx, s.db, processedEventsRetention); err != nil {
+			if ctx.Err() == nil {
+				s.log.Warn("purging processed events failed", "error", err)
+			}
+		} else if n > 0 {
+			s.log.Info("purged processed events", "rows", n)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }

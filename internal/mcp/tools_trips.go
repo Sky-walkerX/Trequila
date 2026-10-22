@@ -5,14 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/nats-io/nats.go/jetstream"
 	"github.com/sky-walkerx/trequila/internal/providerkeys"
-	"github.com/sky-walkerx/trequila/internal/types"
+	"github.com/sky-walkerx/trequila/internal/trips"
 )
 
 func (s *Server) registerTripTools() {
@@ -66,88 +64,33 @@ func (s *Server) handleCreateTrip(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	args := req.GetArguments()
-	source, _ := args["source"].(string)
-	destination, _ := args["destination"].(string)
-	startDate, _ := args["start_date"].(string)
-	endDate, _ := args["end_date"].(string)
-	budgetF, _ := args["budget"].(float64)
-	budget := int(budgetF)
-	provider, _ := args["provider"].(string)
-	model, _ := args["model"].(string)
+	str := func(k string) string { v, _ := args[k].(string); return v }
+	budget, _ := args["budget"].(float64)
 
-	sd, err := time.Parse("2006-01-02", startDate)
+	id, _, err := s.trips.Create(ctx, trips.CreateParams{
+		UserID:      userID,
+		Source:      str("source"),
+		Destination: str("destination"),
+		StartDate:   str("start_date"),
+		EndDate:     str("end_date"),
+		Budget:      int(budget),
+		Provider:    str("provider"),
+		Model:       str("model"),
+	})
 	if err != nil {
-		return mcp.NewToolResultError("invalid start_date format, expected YYYY-MM-DD"), nil
-	}
-	ed, err := time.Parse("2006-01-02", endDate)
-	if err != nil {
-		return mcp.NewToolResultError("invalid end_date format, expected YYYY-MM-DD"), nil
-	}
-	if ed.Before(sd) {
-		return mcp.NewToolResultError("end_date must be after start_date"), nil
-	}
-
-	days := int(ed.Sub(sd).Hours()/24) + 1
-
-	cfg, err := s.keyStore.Resolve(ctx, userID, provider)
-	if err != nil {
-		if errors.Is(err, providerkeys.ErrNoKey) {
+		var verr *trips.ValidationError
+		switch {
+		case errors.As(err, &verr):
+			return mcp.NewToolResultError(verr.Message), nil
+		case errors.Is(err, providerkeys.ErrNoKey):
 			return mcp.NewToolResultError("Please configure an API key for the AI provider first"), nil
+		default:
+			slog.Error("mcp create_trip failed", "user_id", userID, "error", err)
+			return mcp.NewToolResultError("Failed to create the trip"), nil
 		}
-		return mcp.NewToolResultError("Failed to resolve API key"), nil
-	}
-	if provider == "" {
-		provider = string(cfg.Kind)
-	}
-	if model == "" {
-		model = cfg.Model
 	}
 
-	requestID := uuid.NewString()
-
-	_, err = s.db.Exec(`
-		INSERT INTO trips (request_id, user_id, source, destination, start_date, end_date, budget, status, provider, model)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)`,
-		requestID, userID, source, destination, startDate, endDate, budget, provider, model,
-	)
-	if err != nil {
-		log.Printf("DB Insert error: %v", err)
-		return mcp.NewToolResultError("Database error when creating trip"), nil
-	}
-
-	event := types.TripEvent{
-		Type: "TripRequested",
-		Data: types.TripRequest{
-			RequestID:   requestID,
-			UserID:      userID,
-			Source:      source,
-			Destination: destination,
-			StartDate:   startDate,
-			EndDate:     endDate,
-			Days:        days,
-			Budget:      budget,
-			Interests:   []string{}, // optional
-			Provider:    provider,
-			Model:       model,
-			CreatedAt:   time.Now().UTC().Format(time.RFC3339),
-		},
-	}
-
-	data, _ := json.Marshal(event)
-	pubCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	_, err = s.js.Publish(pubCtx, "trips.requested", data, jetstream.WithMsgID(requestID))
-	if err != nil {
-		log.Printf("NATS Publish error: %v", err)
-		return mcp.NewToolResultError("Failed to queue trip for generation"), nil
-	}
-
-	res := map[string]interface{}{
-		"trip_id": requestID,
-		"status":  "pending",
-	}
-	resJSON, _ := json.Marshal(res)
+	resJSON, _ := json.Marshal(map[string]interface{}{"trip_id": id, "status": "pending"})
 	return mcp.NewToolResultText(string(resJSON)), nil
 }
 

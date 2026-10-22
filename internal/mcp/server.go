@@ -5,19 +5,17 @@ import (
 	"net/http"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
 	authpkg "github.com/sky-walkerx/trequila/internal/auth"
 	"github.com/sky-walkerx/trequila/internal/geo"
 	"github.com/sky-walkerx/trequila/internal/images"
 	"github.com/sky-walkerx/trequila/internal/providerkeys"
+	"github.com/sky-walkerx/trequila/internal/trips"
 )
 
 // Server wraps the MCP server with Trequila's service dependencies.
 type Server struct {
 	db       *sql.DB
-	js       jetstream.JetStream
-	nc       *nats.Conn
+	trips    *trips.Store
 	keyStore *providerkeys.Store
 	geo      *geo.Service
 	images   *images.Service
@@ -26,11 +24,10 @@ type Server struct {
 }
 
 // NewServer creates a new Trequila MCP server.
-func NewServer(db *sql.DB, js jetstream.JetStream, nc *nats.Conn, keyStore *providerkeys.Store, geoSvc *geo.Service, imgSvc *images.Service, authSvc *authpkg.AuthService) *Server {
+func NewServer(db *sql.DB, tripStore *trips.Store, keyStore *providerkeys.Store, geoSvc *geo.Service, imgSvc *images.Service, authSvc *authpkg.AuthService) *Server {
 	s := &Server{
 		db:       db,
-		js:       js,
-		nc:       nc,
+		trips:    tripStore,
 		keyStore: keyStore,
 		geo:      geoSvc,
 		images:   imgSvc,
