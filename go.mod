@@ -7,7 +7,9 @@ require (
 	github.com/google/generative-ai-go v0.20.1
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/mark3labs/mcp-go v0.55.0
+	github.com/nats-io/nats-server/v2 v2.11.8
 	github.com/nats-io/nats.go v1.47.0
+	github.com/pressly/goose/v3 v3.26.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.17.2
 	golang.org/x/oauth2 v0.34.0
@@ -28,6 +30,7 @@ require (
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/google/go-tpm v0.9.5 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.7 // indirect
@@ -36,8 +39,9 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect
+	github.com/minio/highwayhash v1.0.3 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/pressly/goose/v3 v3.26.0 // indirect
+	github.com/nats-io/jwt/v2 v2.7.4 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
