@@ -147,18 +147,22 @@ func (s *Server) handleGetTrip(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	if len(trip.Itinerary) > 0 {
 		var it []interface{}
-		json.Unmarshal(trip.Itinerary, &it)
-		res["itinerary"] = it
+		if err := json.Unmarshal(trip.Itinerary, &it); err == nil {
+			res["itinerary"] = it
+		}
 	}
 	if len(trip.Images) > 0 {
 		var img []interface{}
-		json.Unmarshal(trip.Images, &img)
-		res["images"] = img
+		if err := json.Unmarshal(trip.Images, &img); err == nil {
+			res["images"] = img
+		}
 	}
 	if len(trip.Places) > 0 {
-		var pl []interface{}
-		json.Unmarshal(trip.Places, &pl)
-		res["places"] = pl
+		// Stored as {hotels, restaurants, attractions}; hand it back as it is.
+		var pl interface{}
+		if err := json.Unmarshal(trip.Places, &pl); err == nil {
+			res["places"] = pl
+		}
 	}
 
 	resJSON, _ := json.Marshal(res)

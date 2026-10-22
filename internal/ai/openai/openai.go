@@ -64,11 +64,6 @@ type functionCall struct {
 	Arguments string `json:"arguments"`
 }
 
-type contentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
-}
-
 type responseFormat struct {
 	Type string `json:"type"`
 }

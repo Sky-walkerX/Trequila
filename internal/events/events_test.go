@@ -13,7 +13,8 @@ func TestIDIsDeterministicPerTypeAndTrip(t *testing.T) {
 	if got := events.ID(events.TripItinerary, "t-1"); got != "trips.itinerary:t-1" {
 		t.Errorf("ID = %q", got)
 	}
-	if events.ID(events.TripItinerary, "t-1") != events.ID(events.TripItinerary, "t-1") {
+	first, second := events.ID(events.TripItinerary, "t-1"), events.ID(events.TripItinerary, "t-1")
+	if first != second {
 		t.Error("ID must be stable so redelivered work de-duplicates")
 	}
 }

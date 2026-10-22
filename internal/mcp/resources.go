@@ -103,8 +103,9 @@ func (s *Server) handleResourceTripDetails(ctx context.Context, req mcp.ReadReso
 	}
 	if len(trip.Itinerary) > 0 {
 		var it []interface{}
-		json.Unmarshal(trip.Itinerary, &it)
-		res["itinerary"] = it
+		if err := json.Unmarshal(trip.Itinerary, &it); err == nil {
+			res["itinerary"] = it
+		}
 	}
 
 	resJSON, _ := json.Marshal(res)

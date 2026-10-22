@@ -50,7 +50,7 @@ func EmptyWithURL(tb testing.TB) (*sql.DB, string) {
 	}
 	schema := "t_" + hex.EncodeToString(raw[:])
 	if _, err := admin.Exec(`CREATE SCHEMA ` + schema); err != nil {
-		admin.Close()
+		_ = admin.Close()
 		tb.Fatalf("testdb: create schema: %v", err)
 	}
 
@@ -67,9 +67,9 @@ func EmptyWithURL(tb testing.TB) (*sql.DB, string) {
 		tb.Fatalf("testdb: open: %v", err)
 	}
 	tb.Cleanup(func() {
-		db.Close()
-		admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
-		admin.Close()
+		_ = db.Close()
+		_, _ = admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
+		_ = admin.Close()
 	})
 	return db, u.String()
 }

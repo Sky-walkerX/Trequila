@@ -18,7 +18,9 @@ func (s *Server) MCPToolDefinitions() []ai.ToolDefinition {
 		var schema map[string]interface{}
 
 		raw, _ := json.Marshal(st.Tool.InputSchema)
-		json.Unmarshal(raw, &schema)
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			continue // a tool whose schema cannot be read cannot be offered to a model
+		}
 
 		defs = append(defs, ai.ToolDefinition{
 			Name:        st.Tool.Name,

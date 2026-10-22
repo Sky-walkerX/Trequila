@@ -12,8 +12,11 @@ import (
 
 func (s *Service) handleStreamTripAuth(w http.ResponseWriter, r *http.Request, userID, tripID string) {
 	var exists bool
-	s.db.QueryRowContext(r.Context(),
-		`SELECT EXISTS(SELECT 1 FROM trips WHERE request_id = $1 AND user_id = $2)`, tripID, userID).Scan(&exists)
+	if err := s.db.QueryRowContext(r.Context(),
+		`SELECT EXISTS(SELECT 1 FROM trips WHERE request_id = $1 AND user_id = $2)`, tripID, userID).Scan(&exists); err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
 	if !exists {
 		writeError(w, http.StatusNotFound, "trip not found")
 		return

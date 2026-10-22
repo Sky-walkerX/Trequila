@@ -105,7 +105,10 @@ func (s *Service) handleListUserTrips(w http.ResponseWriter, r *http.Request, us
 	offset := (page - 1) * limit
 
 	var total int
-	s.db.QueryRow(`SELECT COUNT(*) FROM trips WHERE user_id = $1`, userID).Scan(&total)
+	if err := s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM trips WHERE user_id = $1`, userID).Scan(&total); err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
 
 	rows, err := s.db.Query(`
 		SELECT request_id, source, destination, start_date, end_date, budget, status, created_at

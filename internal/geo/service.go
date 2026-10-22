@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -131,9 +132,11 @@ func (s *Service) GetCoordinates(city string) (float64, float64, error) {
 		return 0, 0, fmt.Errorf("location not found")
 	}
 
-	var lat, lon float64
-	fmt.Sscanf(result[0].Lat, "%f", &lat)
-	fmt.Sscanf(result[0].Lon, "%f", &lon)
+	lat, latErr := strconv.ParseFloat(result[0].Lat, 64)
+	lon, lonErr := strconv.ParseFloat(result[0].Lon, 64)
+	if latErr != nil || lonErr != nil {
+		return 0, 0, fmt.Errorf("geocoder returned unparseable coordinates %q, %q", result[0].Lat, result[0].Lon)
+	}
 
 	if s.redis != nil {
 		data, _ := json.Marshal(Coordinates{Lat: lat, Lon: lon, Found: true})

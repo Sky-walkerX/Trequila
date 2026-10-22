@@ -188,11 +188,10 @@ func (p *Provider) ChatWithTools(ctx context.Context, system string, history []a
 	var msgs []message
 	for _, h := range history {
 		role := h.Role
-		if role == "model" || role == "assistant" {
+		switch role {
+		case "model", "assistant":
 			role = "assistant"
-		} else if role == "tool" {
-			role = "user"
-		} else {
+		default: // "tool" results and user turns are both sent as user messages
 			role = "user"
 		}
 
@@ -285,9 +284,10 @@ func (p *Provider) ChatWithTools(ctx context.Context, system string, history []a
 
 	var chatResp ai.ChatResponse
 	for _, c := range out.Content {
-		if c.Type == "text" {
+		switch c.Type {
+		case "text":
 			chatResp.Content += c.Text
-		} else if c.Type == "tool_use" {
+		case "tool_use":
 			chatResp.ToolCalls = append(chatResp.ToolCalls, ai.ToolCall{
 				ID:        c.ID,
 				Name:      c.Name,

@@ -54,7 +54,9 @@ func (s *Service) handleWeatherReplan(w http.ResponseWriter, r *http.Request) {
 
 	var itinerary []types.DayPlan
 	if len(itineraryJSON) > 0 {
-		json.Unmarshal(itineraryJSON, &itinerary)
+		// A stored itinerary that cannot be read is treated as missing, which the
+		// check just below reports to the caller.
+		_ = json.Unmarshal(itineraryJSON, &itinerary)
 	}
 
 	if len(itinerary) == 0 {
@@ -66,7 +68,7 @@ func (s *Service) handleWeatherReplan(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DayIndex *int `json:"day_index"` // nil = replan all rainy days
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	_ = json.NewDecoder(r.Body).Decode(&req) // the body is optional
 
 	// Fetch weather forecast for the destination
 	// Use geocoding to get lat/lon (we'll use a simple approach)
@@ -109,7 +111,8 @@ func (s *Service) handleWeatherReplan(w http.ResponseWriter, r *http.Request) {
 	wResp, err := http.Get(forecastURL)
 	if err == nil {
 		defer wResp.Body.Close()
-		json.NewDecoder(wResp.Body).Decode(&forecast)
+		// No usable forecast means no rainy days are found; the handler reports that.
+		_ = json.NewDecoder(wResp.Body).Decode(&forecast)
 	}
 
 	// Determine which days need replanning
@@ -242,9 +245,16 @@ Return a JSON array of replanned day objects.`, destination, string(daysJSON), w
 	}
 
 	// Save updated itinerary
-	updatedJSON, _ := json.Marshal(itinerary)
-	s.db.Exec(`UPDATE trips SET itinerary = $1, updated_at = NOW() WHERE request_id = $2`,
-		string(updatedJSON), tripID)
+	updatedJSON, err := json.Marshal(itinerary)
+	if err == nil {
+		_, err = s.db.ExecContext(r.Context(), `UPDATE trips SET itinerary = $1, updated_at = NOW() WHERE request_id = $2`,
+			string(updatedJSON), tripID)
+	}
+	if err != nil {
+		s.log.Error("replan: could not save the itinerary", "trip_id", tripID, "error", err)
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
