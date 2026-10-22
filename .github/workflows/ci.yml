@@ -12,9 +12,23 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  POSTGRES_URL: postgres://trequila:trequila@localhost:5432/trequila?sslmode=disable
+
 jobs:
-  go:
+  test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: trequila
+          POSTGRES_PASSWORD: trequila
+          POSTGRES_DB: trequila
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U trequila -d trequila"
+          --health-interval 5s --health-timeout 3s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -24,8 +38,48 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - name: Vet
         run: go vet ./...
-      - name: Test
-        run: go test -race ./...
+      - name: Test (race detector, real Postgres)
+        env:
+          TEST_DATABASE_URL: ${{ env.POSTGRES_URL }}
+        run: go test -race -count=1 ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: trequila
+          POSTGRES_PASSWORD: trequila
+          POSTGRES_DB: trequila
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U trequila -d trequila"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Migrations apply, roll back and apply again
+        env:
+          DATABASE_URL: ${{ env.POSTGRES_URL }}
+        run: |
+          go run ./cmd/migrate up
+          go run ./cmd/migrate reset
+          go run ./cmd/migrate up
+          go run ./cmd/migrate status
 
   docker:
     runs-on: ubuntu-latest

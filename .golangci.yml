@@ -1,0 +1,43 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Calls whose failure there is nothing useful to do about: releasing a resource
+      # after the work succeeded or failed already, or writing to a client that has gone
+      # away. Everything else must be checked.
+      exclude-functions:
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.Tx).Rollback
+        - (*github.com/jackc/pgx/v5.Conn).Close
+        - (github.com/sky-walkerx/trequila/internal/ai.LLMProvider).Close
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (net/http.ResponseWriter).Write
+        - (*encoding/json.Encoder).Encode
+        # A failed ack only means the broker redelivers; handlers are idempotent.
+        - (github.com/nats-io/nats.go/jetstream.Msg).Ack
+        - (github.com/nats-io/nats.go/jetstream.Msg).NakWithDelay
+  exclusions:
+    rules:
+      # Tests may ignore the error from best-effort setup and cleanup calls.
+      - path: _test\.go
+        linters: [errcheck]
+
+formatters:
+  enable:
+    - gofmt
