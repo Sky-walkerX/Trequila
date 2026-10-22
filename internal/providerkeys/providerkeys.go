@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 
 	"github.com/sky-walkerx/trequila/internal/ai"
 	"github.com/sky-walkerx/trequila/internal/crypto"
+	"github.com/sky-walkerx/trequila/internal/netguard"
 )
 
 var ErrNoKey = errors.New("providerkeys: no configured key found")
@@ -120,7 +122,18 @@ func (s *Store) List(ctx context.Context, userID string) ([]ProviderKey, error) 
 	return keys, nil
 }
 
+// ErrInvalidBaseURL means a provider base URL was rejected: not https, or pointing at a
+// private or internal address. The wrapped message is safe to show to the user.
+var ErrInvalidBaseURL = errors.New("invalid base_url")
+
+// Upsert stores (or replaces) a user's key for a provider. A base URL is validated
+// first, because the server will make requests to it on the user's behalf.
 func (s *Store) Upsert(ctx context.Context, userID, provider, apiKey, baseURL, defaultModel string, makeDefault bool) error {
+	if baseURL != "" {
+		if _, err := netguard.ValidateBaseURL(baseURL, netguard.AllowPrivateFromEnv()); err != nil {
+			return fmt.Errorf("%w: %s", ErrInvalidBaseURL, err.Error())
+		}
+	}
 	encKey, err := s.cipher.Encrypt(apiKey)
 	if err != nil {
 		return err

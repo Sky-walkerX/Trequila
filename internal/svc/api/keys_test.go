@@ -119,3 +119,56 @@ func TestKeysAPI(t *testing.T) {
 		}
 	})
 }
+
+func TestKeysAPIRefusesBaseURLsThatReachInternalServices(t *testing.T) {
+	srv, _, userID := setupTestServer(t)
+	mux := http.NewServeMux()
+	srv.Routes(mux)
+	token, _ := srv.auth.GenerateToken(userID, "api@example.com", "Test User", "local")
+
+	post := func(path string, body map[string]any) (int, string) {
+		b, _ := json.Marshal(body)
+		req := httptest.NewRequest("POST", path, bytes.NewReader(b))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		return rr.Code, rr.Body.String()
+	}
+
+	for _, target := range []string{"https://169.254.169.254/latest", "https://127.0.0.1:9", "http://example.com/v1", "https://10.0.0.1"} {
+		code, body := post("/api/keys", map[string]any{"provider": "openai_compatible", "api_key": "k", "base_url": target, "default_model": "m"})
+		if code != http.StatusBadRequest || !strings.Contains(body, "base_url") {
+			t.Errorf("saving %s: %d %q, want 400 naming base_url", target, code, body)
+		}
+		code, body = post("/api/keys/test", map[string]any{"provider": "openai_compatible", "api_key": "k", "base_url": target, "model": "m"})
+		if code != http.StatusBadRequest {
+			t.Errorf("testing %s: %d %q, want 400", target, code, body)
+		}
+	}
+}
+
+func TestKeyTestDoesNotEchoWhatTheUpstreamSaid(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_PROVIDER_URLS", "true") // reach the fake upstream on loopback
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "internal secret: db password is hunter2", http.StatusBadRequest)
+	}))
+	defer upstream.Close()
+
+	srv, _, userID := setupTestServer(t)
+	mux := http.NewServeMux()
+	srv.Routes(mux)
+	token, _ := srv.auth.GenerateToken(userID, "api@example.com", "Test User", "local")
+
+	b, _ := json.Marshal(map[string]any{"provider": "openai_compatible", "api_key": "k", "base_url": upstream.URL, "model": "m"})
+	req := httptest.NewRequest("POST", "/api/keys/test", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if strings.Contains(rr.Body.String(), "hunter2") || strings.Contains(rr.Body.String(), "internal secret") {
+		t.Errorf("the upstream's response leaked to the caller: %s", rr.Body.String())
+	}
+	if rr.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rr.Code)
+	}
+}

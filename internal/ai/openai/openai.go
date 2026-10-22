@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sky-walkerx/trequila/internal/ai"
+	"github.com/sky-walkerx/trequila/internal/netguard"
 	"github.com/sky-walkerx/trequila/internal/types"
 )
 
@@ -41,7 +42,7 @@ func NewProvider(_ context.Context, cfg ai.ProviderConfig) (*Provider, error) {
 		apiKey:  cfg.APIKey,
 		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
 		model:   model,
-		client:  &http.Client{Timeout: 120 * time.Second},
+		client:  &http.Client{Timeout: 120 * time.Second, Transport: netguard.Transport(netguard.AllowPrivateFromEnv())},
 	}, nil
 }
 

@@ -2,14 +2,13 @@ package providerkeys
 
 import (
 	"context"
-	"database/sql"
-	"os"
+	"errors"
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/sky-walkerx/trequila/internal/ai"
 	"github.com/sky-walkerx/trequila/internal/crypto"
+	"github.com/sky-walkerx/trequila/internal/testdb"
 )
 
 func TestMaskKey(t *testing.T) {
@@ -32,30 +31,15 @@ func TestMaskKey(t *testing.T) {
 }
 
 func TestStore_Integration(t *testing.T) {
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		t.Skip("Skipping integration test: DATABASE_URL not set")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	db, err := sql.Open("pgx", dbURL)
-	if err != nil {
-		t.Fatalf("Failed to connect to database: %v", err)
-	}
-	defer db.Close()
-
-	// Need a valid user in DB to satisfy foreign key.
-	// We insert a dummy user and clean it up.
+	db := testdb.New(t)
 	userID := "test-user-providerkeys"
-	_, err = db.Exec("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", userID, "test@example.com", "hash")
-	if err != nil {
+	if _, err := db.Exec("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)", userID, "test@example.com", "hash"); err != nil {
 		t.Fatalf("Failed to insert dummy user: %v", err)
 	}
-	defer func() {
-		db.Exec("DELETE FROM users WHERE id = $1", userID)
-	}()
+	var err error
 
 	key := make([]byte, 32)
 	c, err := crypto.NewCipher(key)
@@ -98,7 +82,7 @@ func TestStore_Integration(t *testing.T) {
 	if len(keys) != 1 {
 		t.Fatalf("Expected 1 key, got %d", len(keys))
 	}
-	if keys[0].Provider != "gemini" || keys[0].MaskedKey != "...t-key" || !keys[0].IsDefault {
+	if keys[0].Provider != "gemini" || keys[0].MaskedKey != "...-key" || !keys[0].IsDefault {
 		t.Errorf("Unexpected listed key: %+v", keys[0])
 	}
 
@@ -115,5 +99,50 @@ func TestStore_Integration(t *testing.T) {
 	}
 	if cfg.Kind != ai.ProviderAnthropic || cfg.APIKey != "anthropic-key" || cfg.Model != "claude-3-haiku" {
 		t.Errorf("Unexpected resolved override config: %+v", cfg)
+	}
+}
+
+func TestUpsertRejectsBaseURLsThatReachInternalServices(t *testing.T) {
+	db := testdb.New(t)
+	if _, err := db.Exec("INSERT INTO users (id, email) VALUES ('u1', 'u1@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := crypto.NewCipher(make([]byte, 32))
+	store := NewStore(db, c)
+	ctx := context.Background()
+
+	for _, bad := range []string{
+		"http://api.example.com/v1",                // not https
+		"https://169.254.169.254/latest/meta-data", // cloud metadata
+		"https://127.0.0.1:8080",                   // loopback
+		"https://10.0.0.7/v1",                      // private
+		"https://metadata.google.internal",         // internal name
+		"https://user:pw@api.example.com",          // credentials in the URL
+	} {
+		err := store.Upsert(ctx, "u1", "openai_compatible", "k", bad, "gpt-4o", true)
+		if !errors.Is(err, ErrInvalidBaseURL) {
+			t.Errorf("Upsert(%q) = %v, want ErrInvalidBaseURL", bad, err)
+		}
+	}
+	var n int
+	db.QueryRow("SELECT count(*) FROM provider_keys").Scan(&n)
+	if n != 0 {
+		t.Errorf("a rejected key was stored: %d rows", n)
+	}
+
+	if err := store.Upsert(ctx, "u1", "openai_compatible", "k", "https://api.openai.com/v1", "gpt-4o", true); err != nil {
+		t.Errorf("a public https URL should be accepted: %v", err)
+	}
+}
+
+func TestUpsertAllowsPrivateBaseURLsWhenTheOperatorOptsIn(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_PROVIDER_URLS", "true")
+	db := testdb.New(t)
+	db.Exec("INSERT INTO users (id, email) VALUES ('u1', 'u1@example.com')")
+	c, _ := crypto.NewCipher(make([]byte, 32))
+
+	err := NewStore(db, c).Upsert(context.Background(), "u1", "openai_compatible", "", "http://localhost:11434/v1", "llama3", true)
+	if err != nil {
+		t.Errorf("self-hosters running a local model must be able to opt in: %v", err)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/sky-walkerx/trequila/internal/ai"
 	"github.com/sky-walkerx/trequila/internal/auth"
 	"github.com/sky-walkerx/trequila/internal/llm"
+	"github.com/sky-walkerx/trequila/internal/netguard"
 	"github.com/sky-walkerx/trequila/internal/providerkeys"
 )
 
@@ -25,7 +26,8 @@ func (s *Service) handleKeys(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		keys, err := s.keys.List(r.Context(), userID)
 		if err != nil {
-			http.Error(w, "Failed to list keys: "+err.Error(), http.StatusInternalServerError)
+			s.log.Error("list keys failed", "user_id", userID, "error", err)
+			http.Error(w, "Failed to list keys", http.StatusInternalServerError)
 			return
 		}
 		if keys == nil {
@@ -53,7 +55,12 @@ func (s *Service) handleKeys(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := s.keys.Upsert(r.Context(), userID, req.Provider, req.APIKey, req.BaseURL, req.DefaultModel, req.MakeDefault); err != nil {
-			http.Error(w, "Failed to save key: "+err.Error(), http.StatusInternalServerError)
+			if errors.Is(err, providerkeys.ErrInvalidBaseURL) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			s.log.Error("save key failed", "user_id", userID, "provider", req.Provider, "error", err)
+			http.Error(w, "Failed to save key", http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -80,7 +87,8 @@ func (s *Service) handleKeyByProvider(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodDelete {
 		if err := s.keys.Delete(r.Context(), userID, provider); err != nil {
-			http.Error(w, "Failed to delete key: "+err.Error(), http.StatusInternalServerError)
+			s.log.Error("delete key failed", "user_id", userID, "provider", provider, "error", err)
+			http.Error(w, "Failed to delete key", http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -120,6 +128,12 @@ func (s *Service) handleKeysTest(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Missing provider", http.StatusBadRequest)
 			return
 		}
+		if req.BaseURL != "" {
+			if _, err := netguard.ValidateBaseURL(req.BaseURL, netguard.AllowPrivateFromEnv()); err != nil {
+				writeKeyTestResult(w, http.StatusBadRequest, false, err.Error())
+				return
+			}
+		}
 		cfg = ai.ProviderConfig{
 			Kind:    ai.ProviderKind(req.Provider),
 			APIKey:  req.APIKey,
@@ -148,17 +162,24 @@ func (s *Service) handleKeysTest(w http.ResponseWriter, r *http.Request) {
 
 	provider, err := llm.NewProvider(ctx, cfg)
 	if err != nil {
-		writeKeyTestResult(w, http.StatusBadRequest, false, err.Error())
+		s.log.Info("key test: provider could not be built", "user_id", userID, "provider", cfg.Kind, "error", err)
+		writeKeyTestResult(w, http.StatusBadRequest, false, "unsupported provider or model")
 		return
 	}
 	defer provider.Close()
 
 	if _, err := provider.Chat(ctx, "Reply with the single word: ok.", nil, "ping"); err != nil {
-		status := http.StatusBadGateway
-		if ai.IsAuthError(err) {
-			status = http.StatusUnauthorized
+		// Whatever the upstream said stays in the server log. Echoing it would let a
+		// caller read responses from arbitrary hosts through this endpoint.
+		s.log.Info("key test failed", "user_id", userID, "provider", cfg.Kind, "error", err)
+		switch {
+		case errors.Is(err, netguard.ErrBlockedAddress):
+			writeKeyTestResult(w, http.StatusBadRequest, false, "that address is not allowed")
+		case ai.IsAuthError(err):
+			writeKeyTestResult(w, http.StatusUnauthorized, false, "the provider rejected the credentials")
+		default:
+			writeKeyTestResult(w, http.StatusBadGateway, false, "could not get a response from the provider")
 		}
-		writeKeyTestResult(w, status, false, err.Error())
 		return
 	}
 

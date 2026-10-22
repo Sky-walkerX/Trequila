@@ -3,8 +3,11 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/sky-walkerx/trequila/internal/providerkeys"
 )
 
 func (s *Server) registerKeyTools() {
@@ -63,7 +66,11 @@ func (s *Server) handleSetKey(ctx context.Context, req mcp.CallToolRequest) (*mc
 
 	err := s.keyStore.Upsert(ctx, userID, provider, apiKey, baseURL, model, makeDefault)
 	if err != nil {
-		return mcp.NewToolResultError("Failed to save key: " + err.Error()), nil
+		if errors.Is(err, providerkeys.ErrInvalidBaseURL) {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		slog.Error("mcp set_api_key failed", "user_id", userID, "error", err)
+		return mcp.NewToolResultError("Failed to save key"), nil
 	}
 
 	resJSON, _ := json.Marshal(map[string]bool{"saved": true})
