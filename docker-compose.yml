@@ -4,8 +4,8 @@
 #   make up    # build and start everything
 #
 # Every published port is bound to 127.0.0.1, so nothing is reachable from your
-# network. The API listens on http://localhost:8080. Postgres is initialised from
-# init.sql on the first start only; `make reset` wipes the volume and starts over.
+# network. The API listens on http://localhost:8080. The one-shot `migrate` service
+# applies the schema before the API starts; `make reset` wipes the volumes.
 name: trequila
 
 services:
@@ -19,7 +19,6 @@ services:
       - "127.0.0.1:55432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U trequila -d trequila"]
       interval: 5s
@@ -49,13 +48,24 @@ services:
       timeout: 3s
       retries: 10
 
+  migrate:
+    build: .
+    entrypoint: ["/app/migrate"]
+    command: ["up"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://trequila:${POSTGRES_PASSWORD}@db:5432/trequila?sslmode=disable
+    restart: "no"
+
   api:
     build: .
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       nats:
         condition: service_healthy
       redis:
