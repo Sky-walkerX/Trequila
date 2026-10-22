@@ -1,0 +1,79 @@
+# Local development stack: Postgres, NATS JetStream, Redis and the API.
+#
+#   make env   # once: writes .env with fresh local secrets
+#   make up    # build and start everything
+#
+# Every published port is bound to 127.0.0.1, so nothing is reachable from your
+# network. The API listens on http://localhost:8080. Postgres is initialised from
+# init.sql on the first start only; `make reset` wipes the volume and starts over.
+name: trequila
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trequila
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run `make env` to generate .env}
+      POSTGRES_DB: trequila
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trequila -d trequila"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nats:
+    image: nats:2-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:54222:4222"
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:56379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://trequila:${POSTGRES_PASSWORD}@db:5432/trequila?sslmode=disable
+      NATS_URL: nats://nats:4222
+      REDIS_URL: redis:6379
+      JWT_SECRET: ${JWT_SECRET:?run `make env` to generate .env}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?run `make env` to generate .env}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URL: ${GOOGLE_REDIRECT_URL:-http://localhost:8080/auth/google/callback}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  natsdata:
