@@ -4,7 +4,7 @@ COMPOSE ?= docker compose
 # refuses to interpolate the required secrets without values.
 STOP := JWT_SECRET=x ENCRYPTION_KEY=x POSTGRES_PASSWORD=x $(COMPOSE)
 
-.PHONY: help env up down reset logs psql build test vet fmt check
+.PHONY: help env up down reset logs psql build test test-int vet fmt check
 
 help: ## List the available targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-8s %s\n", $$1, $$2}'
@@ -35,6 +35,11 @@ build: ## Compile every package
 
 test: ## Run the Go test suite
 	go test ./...
+
+test-int: ## Run the suite including Postgres-backed tests (starts the db service)
+	@test -f .env || { echo "run 'make env' first"; exit 1; }
+	$(COMPOSE) up -d --wait db
+	TEST_DATABASE_URL="postgres://trequila:$$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2)@127.0.0.1:55432/trequila?sslmode=disable" go test -count=1 ./...
 
 vet: ## Run go vet
 	go vet ./...
