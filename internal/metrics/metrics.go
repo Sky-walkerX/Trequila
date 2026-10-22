@@ -89,3 +89,33 @@ var (
 		[]string{"api"},
 	)
 )
+
+var (
+	// EventsHandledTotal counts bus deliveries by subscription and outcome
+	// (ok, retry, permanent).
+	EventsHandledTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "bus_events_handled_total",
+			Help: "Event deliveries handled, by subscription and result",
+		},
+		[]string{"subscription", "result"},
+	)
+
+	// EventHandleDuration times a single handler invocation.
+	EventHandleDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "bus_event_handle_duration_seconds",
+			Help:    "Time spent handling one event delivery",
+			Buckets: []float64{.01, .05, .1, .5, 1, 5, 15, 60, 180},
+		},
+		[]string{"subscription"},
+	)
+
+	// OutboxPending is the number of unpublished outbox rows seen at the last flush.
+	OutboxPending = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "outbox_pending",
+			Help: "Unpublished outbox rows observed at the last relay flush",
+		},
+	)
+)
