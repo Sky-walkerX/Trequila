@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,9 +40,20 @@ type fakeLLM struct {
 	ai.LLMProvider
 	plan []types.DayPlan
 	err  error
+	// hold, when set, delays the answer until it returns true. The pipeline runs the
+	// planner and discovery side by side, so without it the route could be requested
+	// before the places exist and the test would depend on which service is faster.
+	hold func() bool
 }
 
-func (f fakeLLM) GenerateItinerary(context.Context, types.TripRequest) ([]types.DayPlan, error) {
+func (f fakeLLM) GenerateItinerary(ctx context.Context, _ types.TripRequest) ([]types.DayPlan, error) {
+	for f.hold != nil && !f.hold() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 	return f.plan, f.err
 }
 func (f fakeLLM) Close() error { return nil }
@@ -256,7 +268,17 @@ func TestATripGoesFromRequestToCompletedAcrossAllServices(t *testing.T) {
 		{DayIndex: 0, Date: "2026-12-01", Summary: "Belem", Activities: []types.Activity{{Name: "Belem Tower", Time: "10:00"}, {Name: "Alfama", Time: "15:00"}}},
 		{DayIndex: 1, Date: "2026-12-02", Summary: "Old town", Activities: []types.Activity{{Name: "Alfama", Time: "10:00"}}},
 	}
-	s := start(t, fakeLLM{plan: plan})
+	var sys atomic.Pointer[system]
+	s := start(t, fakeLLM{plan: plan, hold: func() bool {
+		cur := sys.Load()
+		if cur == nil {
+			return false
+		}
+		var n int
+		cur.db.QueryRow(`SELECT count(*) FROM trip_events WHERE type = 'places'`).Scan(&n)
+		return n > 0
+	}})
+	sys.Store(s)
 
 	id := s.createTrip()
 	evs := s.stream(id)
