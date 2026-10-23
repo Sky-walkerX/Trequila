@@ -119,11 +119,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 	go_("api-jobs", func() { apiSvc.Run(ctx) })
 	for _, s := range subs {
 		s.Handler = bus.Chain(s.Handler, bus.Recover(log), bus.Logging(log, s.Durable), bus.Metrics(s.Durable))
-		go_(s.Durable, func() {
-			if err := nb.Subscribe(ctx, s); err != nil {
-				log.Error("subscription ended", "durable", s.Durable, "error", err)
-			}
-		})
+		go_(s.Durable, func() { bus.Supervise(ctx, nb, s, log, time.Second) })
 	}
 
 	srv := &http.Server{
