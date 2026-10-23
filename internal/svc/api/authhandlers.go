@@ -2,7 +2,7 @@ package api
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"time"
 
@@ -86,14 +86,15 @@ func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	user, token, err := s.auth.RegisterUser(r.Context(), req.Email, req.Password, req.Name)
 	if err != nil {
-		status := http.StatusInternalServerError
-		switch err {
-		case auth.ErrUserExists:
-			status = http.StatusConflict
-		case auth.ErrInvalidEmail, auth.ErrPasswordRequired:
-			status = http.StatusBadRequest
+		switch {
+		case errors.Is(err, auth.ErrUserExists):
+			writeError(w, http.StatusConflict, "an account with this email already exists")
+		case errors.Is(err, auth.ErrInvalidEmail), errors.Is(err, auth.ErrPasswordRequired), errors.Is(err, auth.ErrWeakPassword):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			s.log.Error("register failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "could not create the account")
 		}
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), status)
 		return
 	}
 
@@ -127,12 +128,17 @@ func (s *Service) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	user, token, err := s.auth.LoginUser(r.Context(), req.Email, req.Password)
 	if err != nil {
-		status := http.StatusUnauthorized
-		switch err {
-		case auth.ErrInvalidEmail, auth.ErrPasswordRequired:
-			status = http.StatusBadRequest
+		switch {
+		case errors.Is(err, auth.ErrInvalidEmail), errors.Is(err, auth.ErrPasswordRequired):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, auth.ErrUserNotFound), errors.Is(err, auth.ErrInvalidPassword), errors.Is(err, auth.ErrOAuthAccount):
+			// One answer for every credential failure, so login cannot be used to find
+			// out which emails are registered.
+			writeError(w, http.StatusUnauthorized, "invalid email or password")
+		default:
+			s.log.Error("login failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "could not sign in")
 		}
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), status)
 		return
 	}
 

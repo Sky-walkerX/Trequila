@@ -28,6 +28,8 @@ var (
 	ErrInvalidPassword  = errors.New("invalid password")
 	ErrInvalidEmail     = errors.New("invalid email")
 	ErrPasswordRequired = errors.New("password required for local accounts")
+	ErrWeakPassword     = errors.New("password must be at least 8 characters")
+	ErrOAuthAccount     = errors.New("this account uses OAuth login, please use Google sign-in")
 )
 
 // Claims represents JWT claims
@@ -256,7 +258,7 @@ func (a *AuthService) RegisterUser(ctx context.Context, email, password, name st
 		return nil, "", ErrPasswordRequired
 	}
 	if len(password) < 8 {
-		return nil, "", errors.New("password must be at least 8 characters")
+		return nil, "", ErrWeakPassword
 	}
 
 	// Check if user already exists
@@ -326,7 +328,7 @@ func (a *AuthService) LoginUser(ctx context.Context, email, password string) (*U
 
 	// Check if user has a password (local account)
 	if !user.PasswordHash.Valid || user.PasswordHash.String == "" {
-		return nil, "", errors.New("this account uses OAuth login, please use Google sign-in")
+		return nil, "", ErrOAuthAccount
 	}
 
 	// Verify password
