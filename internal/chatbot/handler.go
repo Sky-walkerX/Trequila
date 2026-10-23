@@ -3,6 +3,7 @@ package chatbot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -89,13 +90,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1. Resolve user's LLM provider
 	providerCfg, err := h.keys.Resolve(r.Context(), userID, "")
 	if err != nil {
-		sse.Send("error", map[string]string{"text": "Failed to resolve AI provider key: " + err.Error()})
+		slog.Warn("chatbot: could not resolve the provider key", "error", err)
+		msg := "Could not load your API key."
+		if errors.Is(err, providerkeys.ErrNoKey) {
+			msg = "Add an API key in Settings first."
+		}
+		sse.Send("error", map[string]string{"text": msg})
 		return
 	}
 
 	llmProv, err := llm.NewProvider(r.Context(), providerCfg)
 	if err != nil {
-		sse.Send("error", map[string]string{"text": "Failed to initialize AI provider: " + err.Error()})
+		slog.Warn("chatbot: could not initialise the provider", "error", err)
+		sse.Send("error", map[string]string{"text": "The AI provider could not be set up. Check your key settings."})
 		return
 	}
 	defer llmProv.Close()
@@ -170,7 +177,9 @@ func (h *Handler) runAgentLoop(ctx context.Context, llmProv ai.LLMProvider, conv
 
 		resp, err := llmProv.ChatWithTools(ctx, systemPrompt, conv.Messages, tools)
 		if err != nil {
-			sse.Send("error", map[string]string{"text": "AI error: " + err.Error()})
+			// What the provider said stays in the log: a user-chosen endpoint could put anything in it.
+			slog.Warn("chatbot: provider error", "conversation_id", conv.ID, "error", err)
+			sse.Send("error", map[string]string{"text": "The AI provider returned an error. Check your key and model."})
 			return
 		}
 

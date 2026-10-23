@@ -158,7 +158,7 @@ by an async `weather_replan` edit in Phase 5):
   mid-flight: 2 min for the planner, 5 min for places (three sequential Overpass queries), 5 min for route
   (bounded by its own 3-min geocode budget). The five `api-*` result consumers are 30s each.
 - **Provider base URLs are an SSRF surface.** `base_url` on an OpenAI-compatible key is user-chosen and the
-  server calls it. `netguard.ValidateBaseURL` rejects non-https and internal hosts on save, and
+  server calls it (native providers ignore it and always use their own endpoint). `netguard.ValidateBaseURL` rejects non-https and internal hosts on save, and
   `netguard.Transport` (used by the OpenAI adapter) refuses to *connect* to non-public addresses, which also
   covers DNS rebinding and redirects. Operators who run a model on their own network opt in with
   `ALLOW_PRIVATE_PROVIDER_URLS=true`. Never return an upstream's response or error text to the caller.

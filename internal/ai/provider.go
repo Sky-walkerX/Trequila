@@ -24,7 +24,7 @@ var (
 type ProviderConfig struct {
 	Kind    ProviderKind
 	APIKey  string
-	BaseURL string // required for ProviderOpenAICompatible; ignored by native providers
+	BaseURL string // required for ProviderOpenAICompatible; native providers ignore it and use their own endpoint
 	Model   string
 }
 

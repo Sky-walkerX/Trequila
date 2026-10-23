@@ -35,17 +35,13 @@ func NewProvider(_ context.Context, cfg ai.ProviderConfig) (*Provider, error) {
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("anthropic: API key is required")
 	}
-	base := cfg.BaseURL
-	if base == "" {
-		base = defaultBaseURL
-	}
 	model := cfg.Model
 	if model == "" {
 		model = defaultModel
 	}
 	return &Provider{
 		apiKey:  cfg.APIKey,
-		baseURL: strings.TrimRight(base, "/"),
+		baseURL: defaultBaseURL, // cfg.BaseURL is deliberately ignored: see ai.ProviderConfig
 		model:   model,
 		client:  &http.Client{Timeout: 120 * time.Second},
 	}, nil
