@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -112,6 +113,13 @@ func TestValidationErrors(t *testing.T) {
 		"missing destination": func(p *trips.CreateParams) { p.Destination = "" },
 		"bad start date":      func(p *trips.CreateParams) { p.StartDate = "01/12/2026" },
 		"end before start":    func(p *trips.CreateParams) { p.EndDate = "2026-11-01" },
+		"huge destination":    func(p *trips.CreateParams) { p.Destination = strings.Repeat("x", 5000) },
+		"huge interest":       func(p *trips.CreateParams) { p.Interests = []string{strings.Repeat("x", 5000)} },
+		"too many interests":  func(p *trips.CreateParams) { p.Interests = make([]string, 500) },
+		"huge model name":     func(p *trips.CreateParams) { p.Model = strings.Repeat("m", 5000) },
+		"negative days":       func(p *trips.CreateParams) { p.Days = -1 },
+		"months-long trip":    func(p *trips.CreateParams) { p.EndDate = "2027-12-01" },
+		"absurd day count":    func(p *trips.CreateParams) { p.Days = 100000 },
 	}
 	for name, mutate := range cases {
 		p := params()

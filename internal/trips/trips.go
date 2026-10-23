@@ -173,12 +173,41 @@ func (s *Store) replay(ctx context.Context, q queryer, userID, key, hash string)
 	return id, true, nil
 }
 
+// Limits on what a request may carry. They keep a single request from producing an
+// event the broker refuses or a prompt no model will accept.
+const (
+	maxTextLen       = 200
+	maxInterests     = 20
+	maxInterestLen   = 60
+	maxProviderField = 100
+	maxTripDays      = 30
+)
+
 func validate(p CreateParams) (days int, err error) {
 	if p.UserID == "" {
 		return 0, &ValidationError{"user is required"}
 	}
 	if p.Source == "" || p.Destination == "" || p.StartDate == "" || p.EndDate == "" {
 		return 0, &ValidationError{"source, destination, start_date and end_date are required"}
+	}
+	for _, v := range []string{p.Source, p.Destination} {
+		if len(v) > maxTextLen {
+			return 0, &ValidationError{"source and destination must be at most 200 characters"}
+		}
+	}
+	if len(p.Provider) > maxProviderField || len(p.Model) > maxProviderField {
+		return 0, &ValidationError{"provider and model must be at most 100 characters"}
+	}
+	if len(p.Interests) > maxInterests {
+		return 0, &ValidationError{"at most 20 interests are allowed"}
+	}
+	for _, in := range p.Interests {
+		if len(in) > maxInterestLen {
+			return 0, &ValidationError{"each interest must be at most 60 characters"}
+		}
+	}
+	if p.Days < 0 || p.Days > maxTripDays || p.Budget < 0 {
+		return 0, &ValidationError{"days must be between 0 and 30 and budget must not be negative"}
 	}
 	start, err := time.Parse("2006-01-02", p.StartDate)
 	if err != nil {
@@ -194,6 +223,9 @@ func validate(p CreateParams) (days int, err error) {
 	days = p.Days
 	if days == 0 {
 		days = int(end.Sub(start).Hours()/24) + 1
+	}
+	if days > maxTripDays {
+		return 0, &ValidationError{"trips are limited to 30 days"}
 	}
 	return days, nil
 }

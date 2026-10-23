@@ -39,6 +39,9 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// maxRequestBody bounds every request body; the largest legitimate one is a chat turn.
+const maxRequestBody = 256 << 10
+
 func main() {
 	cfg := config.Load()
 	log := logging.Setup(cfg.LogLevel, cfg.LogFormat)
@@ -125,7 +128,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: middleware.CORS(middleware.DefaultCORSConfig())(middleware.NewRateLimiter(rate.Limit(10), 20).Limit(mux)),
+		Handler: middleware.CORS(middleware.DefaultCORSConfig())(middleware.BodyLimit(maxRequestBody)(middleware.NewRateLimiter(rate.Limit(10), 20).Limit(mux))),
 		// No WriteTimeout: it is absolute from the start of the response, so any value
 		// would cap how long an SSE stream may run. The streaming handlers enforce
 		// their own deadlines and send heartbeats; other handlers return promptly.
