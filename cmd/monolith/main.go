@@ -157,6 +157,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		}
 	}
 
+	apiSvc.BeginShutdown() // open SSE streams would otherwise hold Shutdown for its full deadline
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

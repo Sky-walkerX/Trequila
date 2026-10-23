@@ -54,6 +54,9 @@ type Service struct {
 	log          *slog.Logger
 	metricsToken string
 
+	closing     chan struct{} // closed by BeginShutdown so open streams let go
+	closingOnce sync.Once
+
 	// Stream timings; fields so tests can shorten them.
 	streamHeartbeat   time.Duration
 	streamHardTimeout time.Duration
@@ -79,11 +82,17 @@ func New(d Deps) *Service {
 	return &Service{
 		db: d.DB, auth: d.Auth, keys: d.Keys, trips: d.Trips, hub: d.Hub, relay: d.Relay,
 		pinger: d.Pinger, frontendURL: d.FrontendURL, log: log, metricsToken: d.MetricsToken,
+		closing:           make(chan struct{}),
 		streamHeartbeat:   defaultStreamHeartbeat,
 		streamHardTimeout: defaultStreamHardTimeout,
 		streamPlacesGrace: defaultStreamPlacesGrace,
 	}
 }
+
+// BeginShutdown tells long-lived responses (the SSE streams) to finish, so that
+// http.Server.Shutdown does not wait out its whole deadline for them. Clients reconnect
+// to another instance and resume from Last-Event-ID.
+func (s *Service) BeginShutdown() { s.closingOnce.Do(func() { close(s.closing) }) }
 
 // Routes registers the service's HTTP routes.
 func (s *Service) Routes(mux *http.ServeMux) {

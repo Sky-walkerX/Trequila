@@ -154,6 +154,8 @@ func (s *Service) streamTrip(w http.ResponseWriter, r *http.Request, tripID stri
 		select {
 		case <-ctx.Done():
 			return
+		case <-s.closing:
+			return
 		case <-hard.C:
 			fmt.Fprint(w, "event: timeout\ndata: {\"message\":\"Stream timeout\"}\n\n")
 			flusher.Flush()

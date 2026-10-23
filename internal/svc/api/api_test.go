@@ -484,3 +484,22 @@ func TestMetricsAreOffUnlessATokenIsConfiguredAndThenRequireIt(t *testing.T) {
 		t.Errorf("right token = %d, want 200", got)
 	}
 }
+
+func TestOpenStreamsEndWhenShutdownBegins(t *testing.T) {
+	h := newHarness(t)
+	id := h.newTrip() // never completes: the stream would otherwise stay open
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		h.svc.BeginShutdown()
+	}()
+	start := time.Now()
+	evs, code := h.stream(id, 5*time.Second, nil)
+
+	if code != 200 || len(evs) == 0 {
+		t.Fatalf("stream: %d %v", code, names(evs))
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("the stream outlived the shutdown signal by %v", took)
+	}
+}
