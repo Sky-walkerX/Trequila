@@ -157,13 +157,22 @@ func (b *Bus) Subscribe(ctx context.Context, s bus.Subscription) error {
 	if err != nil {
 		return fmt.Errorf("natsbus: stream %s: %w", StreamName, err)
 	}
-	cons, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+	cfg := jetstream.ConsumerConfig{
 		Durable:       s.Durable,
 		FilterSubject: s.Type,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       ackWait,
 		MaxDeliver:    maxDeliver,
-	})
+		// A durable is new when its name is: a version bump or a first deploy. It must
+		// not replay the stream's retained history, whose effects the previous durable
+		// already had. JetStream cannot change the policy of an existing consumer, so
+		// that one keeps whatever it was created with.
+		DeliverPolicy: jetstream.DeliverNewPolicy,
+	}
+	if existing, err := stream.Consumer(ctx, s.Durable); err == nil {
+		cfg.DeliverPolicy = existing.CachedInfo().Config.DeliverPolicy
+	}
+	cons, err := stream.CreateOrUpdateConsumer(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("natsbus: consumer %s: %w", s.Durable, err)
 	}
@@ -217,6 +226,30 @@ func (b *Bus) deliver(ctx context.Context, s bus.Subscription, ackWait time.Dura
 	case bus.IsPermanent(err):
 		msg.Ack() // redelivery cannot fix it; the logging middleware has already recorded why
 	default:
-		msg.NakWithDelay(b.retry)
+		var delivered uint64
+		if md, err := msg.Metadata(); err == nil {
+			delivered = md.NumDelivered
+		}
+		msg.NakWithDelay(retryDelay(b.retry, delivered))
 	}
+}
+
+// maxRetryDelay caps the growth of the redelivery delay.
+const maxRetryDelay = time.Minute
+
+// retryDelay is how long to wait before redelivering after the nth failed delivery:
+// base, doubling each time, so a database that is briefly down is not hammered and a
+// handler's delivery budget spans minutes rather than seconds.
+func retryDelay(base time.Duration, delivered uint64) time.Duration {
+	if delivered <= 1 {
+		return base
+	}
+	d := base
+	for i := uint64(1); i < delivered; i++ {
+		d *= 2
+		if d >= maxRetryDelay {
+			return maxRetryDelay
+		}
+	}
+	return d
 }

@@ -3,12 +3,14 @@ package natsbus_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/sky-walkerx/trequila/internal/bus"
 	"github.com/sky-walkerx/trequila/internal/bus/natsbus"
 )
@@ -33,22 +35,50 @@ func startServer(t *testing.T) string {
 	return ns.ClientURL()
 }
 
+var serverURLs sync.Map // *natsbus.Bus -> the URL it connected to
+
 func connect(t *testing.T) *natsbus.Bus {
 	t.Helper()
-	b, err := natsbus.Connect(context.Background(), natsbus.Config{URL: startServer(t), RetryDelay: 20 * time.Millisecond})
+	url := startServer(t)
+	b, err := natsbus.Connect(context.Background(), natsbus.Config{URL: url, RetryDelay: 20 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
+	serverURLs.Store(b, url)
 	t.Cleanup(b.Close)
 	return b
 }
 
-func subscribe(t *testing.T, b *natsbus.Bus, s bus.Subscription) {
+// waitForConsumer blocks until the durable exists on the server, so a test can publish
+// knowing a consumer created with "deliver new" will see the event.
+func waitForConsumer(t *testing.T, b *natsbus.Bus, durable string) {
+	t.Helper()
+	url, _ := serverURLs.Load(b)
+	nc, err := nats.Connect(url.(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "consumer "+durable, func() bool {
+		_, err := js.Consumer(context.Background(), natsbus.StreamName, durable)
+		return err == nil
+	})
+}
+
+func subscribe(t *testing.T, b *natsbus.Bus, s bus.Subscription) (stop func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); b.Subscribe(ctx, s) }()
-	t.Cleanup(func() { cancel(); <-done })
+	var once sync.Once
+	stop = func() { once.Do(func() { cancel(); <-done }) }
+	t.Cleanup(stop)
+	waitForConsumer(t, b, s.Durable)
+	return stop
 }
 
 func eventually(t *testing.T, what string, cond func() bool) {
@@ -173,6 +203,7 @@ func TestLegacyEnvelopesWithoutAnIDAreSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	serverURLs.Store(b, url)
 	t.Cleanup(b.Close)
 
 	var ids atomic.Value
@@ -212,5 +243,57 @@ func TestPing(t *testing.T) {
 	b.Close()
 	if err := b.Ping(context.Background()); err == nil {
 		t.Error("ping after close should fail")
+	}
+}
+
+func TestANewDurableSkipsEventsFromBeforeItExisted(t *testing.T) {
+	b := connect(t)
+	if err := b.Publish(context.Background(), mustEvent(t, "trips.requested", "old")); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var seen []string
+	subscribe(t, b, bus.Subscription{Durable: "fresh-v2", Type: "trips.requested", Handler: func(_ context.Context, e bus.Event) error {
+		mu.Lock()
+		seen = append(seen, e.ID)
+		mu.Unlock()
+		return nil
+	}})
+	b.Publish(context.Background(), mustEvent(t, "trips.requested", "new"))
+
+	eventually(t, "the new event", func() bool { mu.Lock(); defer mu.Unlock(); return len(seen) > 0 })
+	time.Sleep(150 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 1 || seen[0] != "new" {
+		t.Errorf("a version bump replayed history: saw %v, want only [new]", seen)
+	}
+}
+
+func TestARestartedDurableResumesWhereItStopped(t *testing.T) {
+	b := connect(t)
+	var mu sync.Mutex
+	var seen []string
+	sub := bus.Subscription{Durable: "resume-v1", Type: "trips.requested", Handler: func(_ context.Context, e bus.Event) error {
+		mu.Lock()
+		seen = append(seen, e.ID)
+		mu.Unlock()
+		return nil
+	}}
+	stop := subscribe(t, b, sub)
+	b.Publish(context.Background(), mustEvent(t, "trips.requested", "e1"))
+	eventually(t, "e1", func() bool { mu.Lock(); defer mu.Unlock(); return len(seen) == 1 })
+	stop()
+
+	b.Publish(context.Background(), mustEvent(t, "trips.requested", "e2")) // while the consumer is down
+	subscribe(t, b, sub)
+
+	eventually(t, "e2 after the restart", func() bool { mu.Lock(); defer mu.Unlock(); return len(seen) == 2 })
+	time.Sleep(150 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[1] != "e2" {
+		t.Errorf("saw %v, want [e1 e2]", seen)
 	}
 }

@@ -36,7 +36,7 @@ func (s *Service) Subscriptions() []bus.Subscription {
 			Durable:    durable,
 			Type:       typ,
 			AckWait:    30 * time.Second,
-			MaxDeliver: 5,
+			MaxDeliver: 10, // with the doubling delay, about five minutes to ride out a database outage
 			Handler: func(ctx context.Context, e bus.Event) error {
 				if err := h(ctx, e); err != nil {
 					return err
