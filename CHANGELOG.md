@@ -28,8 +28,15 @@ All notable changes are documented here. The format follows
 - A database error while looking up a user's key is retried instead of failing the trip as "no key".
 - `/metrics` is served only when `METRICS_TOKEN` is set, and then requires it.
 - `init.sql` and the dated SQL files are replaced by goose migrations (`make up` runs them).
+- An event the broker keeps refusing is parked after five attempts instead of blocking the ones behind it.
+- Open streams end promptly on shutdown, and subscriptions that fail to start are retried.
 
 ### Security
 - Provider `base_url` values are validated and every connection to them is checked, closing a server-side
   request forgery path to internal services (`ALLOW_PRIVATE_PROVIDER_URLS=true` opts out for self-hosters).
 - The key-test endpoint and key handlers no longer return upstream or database error text.
+- Native providers (Anthropic, Gemini) ignore a stored `base_url`, and the chat endpoint no longer relays what a
+  provider said.
+- Request bodies are capped at 256 KiB, and trip requests are limited in text length, interests and trip length.
+- Login answers an unknown email and a wrong password identically; register and login no longer return internal
+  error text.

@@ -536,7 +536,7 @@ The stream emits the following events:
 
 `failed` carries the stored `error_reason`:
 ```json
-{ "type": "failed", "reason": "provider rejected the API key" }
+{ "type": "failed", "reason": "API key invalid, expired, or out of credits." }
 ```
 
 ---

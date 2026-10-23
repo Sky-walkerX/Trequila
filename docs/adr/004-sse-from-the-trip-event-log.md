@@ -30,7 +30,8 @@ seconds after the itinerary, so one failed upstream lookup cannot hold a finishe
 ## Consequences
 
 - No lost events: the doorbell exists before the first query, so anything committed afterwards still rings it.
-- Reconnecting is free and exact, with no duplicates and no gaps.
+- Reconnecting is cheap and exact: the client sends `Last-Event-ID`, the server replays what is newer and
+  remembers which stages the client already saw, so there are no duplicates and no gaps.
 - Streams no longer touch the broker. Each API instance needs one extra database connection for the listener,
   which matters when connections are scarce (the smallest managed Postgres tiers).
 - The log duplicates each result once (it also lives in the `trips` columns). That is the price of an ordered

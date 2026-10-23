@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sky-walkerx/trequila/internal/bus"
 	"github.com/sky-walkerx/trequila/internal/bus/memory"
@@ -236,5 +237,27 @@ func TestTheSameKeyFromAnotherUserIsIndependent(t *testing.T) {
 	idb, _, err2 := e.store.Create(context.Background(), b)
 	if err1 != nil || err2 != nil || ida == idb {
 		t.Fatalf("ida=%q idb=%q errs=%v %v", ida, idb, err1, err2)
+	}
+}
+
+func TestOldIdempotencyKeysArePurged(t *testing.T) {
+	e := setup(t)
+	p := params()
+	p.IdempotencyKey = "old"
+	if _, _, err := e.store.Create(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	p.IdempotencyKey = "recent"
+	if _, _, err := e.store.Create(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	e.db.Exec(`UPDATE idempotency_keys SET created_at = now() - interval '3 days' WHERE key = 'old'`)
+
+	n, err := e.store.PurgeIdempotencyKeys(context.Background(), 24*time.Hour)
+
+	var left int
+	e.db.QueryRow(`SELECT count(*) FROM idempotency_keys`).Scan(&left)
+	if err != nil || n != 1 || left != 1 {
+		t.Errorf("purged %d (%v), %d left; want the old key gone and the recent one kept", n, err, left)
 	}
 }

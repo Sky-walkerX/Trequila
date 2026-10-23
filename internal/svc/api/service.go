@@ -133,6 +133,10 @@ func (s *Service) Run(ctx context.Context) {
 // processedEventsRetention must stay well above the broker's redelivery horizon.
 const processedEventsRetention = 14 * 24 * time.Hour
 
+// idempotencyKeyRetention is how long a client can replay a create request and get the
+// original trip back.
+const idempotencyKeyRetention = 24 * time.Hour
+
 func (s *Service) purgeLoop(ctx context.Context) {
 	t := time.NewTicker(time.Hour)
 	defer t.Stop()
@@ -143,6 +147,13 @@ func (s *Service) purgeLoop(ctx context.Context) {
 			}
 		} else if n > 0 {
 			s.log.Info("purged processed events", "rows", n)
+		}
+		if n, err := s.trips.PurgeIdempotencyKeys(ctx, idempotencyKeyRetention); err != nil {
+			if ctx.Err() == nil {
+				s.log.Warn("purging idempotency keys failed", "error", err)
+			}
+		} else if n > 0 {
+			s.log.Info("purged idempotency keys", "rows", n)
 		}
 		select {
 		case <-ctx.Done():

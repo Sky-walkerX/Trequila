@@ -32,8 +32,8 @@ Run the API from your editor instead of the container by starting only the depen
 [`docker-compose.yml`](docker-compose.yml). Host ports are `55432` (Postgres), `54222` (NATS) and `56379` (Redis), all bound to `127.0.0.1`; the
 Postgres password is `POSTGRES_PASSWORD` in your `.env`.
 
-`init.sql` is the canonical schema and is applied on the first start of an empty database volume. Run
-`make reset` to start from scratch.
+The schema is the goose migrations in `migrations/`; `make up` applies them through the one-shot `migrate`
+service. Run `make reset` to start from scratch.
 
 ## Making a change
 

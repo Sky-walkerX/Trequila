@@ -236,3 +236,14 @@ func requestHash(p CreateParams) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
+
+// PurgeIdempotencyKeys deletes keys older than olderThan, which ends their replay
+// window, and returns how many it removed.
+func (s *Store) PurgeIdempotencyKeys(ctx context.Context, olderThan time.Duration) (int64, error) {
+	res, err := s.DB.ExecContext(ctx,
+		`DELETE FROM idempotency_keys WHERE created_at < now() - make_interval(secs => $1)`, olderThan.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}

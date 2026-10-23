@@ -34,17 +34,12 @@ make check                            # gofmt + go vet + go test (no services ne
 make test-int                         # the same plus the Postgres-backed tests (starts the db service)
 golangci-lint run ./...               # the CI linter (config in .golangci.yml)
 make help                             # logs, psql, down, reset, ...
-psql "$DATABASE_URL" -f init.sql      # canonical schema; migrations/ holds the incremental deltas
+go run ./cmd/migrate up               # apply the schema (migrations/); `status`, `down`, `reset` also exist
 ```
 
 `go.mod` declares **go 1.25.5**; the local toolchain lives at `~/sdk/go` (already on PATH in `~/.zshrc`,
 currently go1.26.4). Docker fallback if the local toolchain is missing:
 `docker run --rm -v "$PWD":/app -w /app -v trequila-gocache:/go/pkg/mod golang:1.25 go build ./...`.
-
-**Testing is deliberately light** — tests exist only for tricky or security-critical pure logic
-(`internal/crypto`, `internal/ai` JSON cleanup, `internal/providerkeys`, `internal/geo`/`internal/images`
-HTTP parsing against `httptest` servers, `cmd/monolith` key handlers and SSE completion logic). Rely on `go build` / `go vet`
-elsewhere rather than adding broad test scaffolding.
 
 Schema changes are goose migrations in `migrations/` (`NNNNN_name.sql` with `-- +goose Up/Down`). The
 `migrate` binary applies them (`make up` runs it as a one-shot service; Heroku runs it in the release phase).
@@ -106,7 +101,10 @@ with `bus.Permanent` when redelivery cannot fix it. Handlers must therefore be i
 **Event IDs are deterministic** where one input yields one output (`events.ID(type, tripID)`), which is what
 lets the broker's de-duplication window, the outbox's unique key and the inbox ledger agree. **Durable names are
 version-suffixed** (`planner-v4`, …): bump the suffix whenever you change a subscription's type or config, or
-JetStream keeps the old consumer state.
+JetStream keeps the old consumer state. A new durable starts at the stream's tail (it does not replay history),
+and redelivery waits 2s, doubling to a minute. When a bump ships, delete the previous durable from the server;
+the pre-Phase-1 ones (`planner-durable-v3`, `api-*-writer-v1`, `imager-worker-v1`, `places-worker-v2`,
+`route-worker-v1`, `vibes-worker-v2`, `api-vibes-writer-v1`) are not used any more.
 
 ### BYOK: keys, providers, factory
 
