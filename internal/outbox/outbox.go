@@ -32,6 +32,11 @@ func Add(ctx context.Context, tx *sql.Tx, e bus.Event) error {
 	return nil
 }
 
+// MaxAttempts is how many times the relay tries an event before parking it. A parked
+// row stays in the table (with its last error) for an operator to inspect, but no longer
+// holds up the events behind it.
+const MaxAttempts = 5
+
 // Relay publishes pending outbox rows.
 type Relay struct {
 	DB  *sql.DB
@@ -48,8 +53,9 @@ func (r *Relay) log() *slog.Logger {
 
 // Flush publishes up to limit pending events in insertion order and returns how many
 // went out. It stops at the first failure, recording the error on that row, so one
-// bad event cannot be skipped silently. Rows locked by another relay are skipped, so
-// any number of relays can run at once.
+// bad event cannot be skipped silently; after MaxAttempts failures the row is parked
+// and no longer selected. Rows locked by another relay are skipped, so any number of
+// relays can run at once.
 func (r *Relay) Flush(ctx context.Context, limit int) (int, error) {
 	tx, err := r.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -58,21 +64,22 @@ func (r *Relay) Flush(ctx context.Context, limit int) (int, error) {
 	defer tx.Rollback()
 
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id, event_id, type, data, COALESCE(traceparent, '')
-		 FROM outbox WHERE published_at IS NULL
-		 ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED`, limit)
+		`SELECT id, attempts, event_id, type, data, COALESCE(traceparent, '')
+		 FROM outbox WHERE published_at IS NULL AND attempts < $2
+		 ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED`, limit, MaxAttempts)
 	if err != nil {
 		return 0, err
 	}
 	type pending struct {
-		id    int64
-		event bus.Event
+		id       int64
+		attempts int
+		event    bus.Event
 	}
 	var batch []pending
 	for rows.Next() {
 		var p pending
 		var data []byte
-		if err := rows.Scan(&p.id, &p.event.ID, &p.event.Type, &data, &p.event.TraceParent); err != nil {
+		if err := rows.Scan(&p.id, &p.attempts, &p.event.ID, &p.event.Type, &data, &p.event.TraceParent); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -89,6 +96,9 @@ func (r *Relay) Flush(ctx context.Context, limit int) (int, error) {
 	for _, p := range batch {
 		if err := r.Pub.Publish(ctx, p.event); err != nil {
 			publishErr = fmt.Errorf("outbox: publish %s %s: %w", p.event.Type, p.event.ID, err)
+			if p.attempts+1 >= MaxAttempts {
+				r.log().Error("outbox event parked after repeated failures", "event_id", p.event.ID, "type", p.event.Type, "error", err)
+			}
 			if _, uerr := tx.ExecContext(ctx,
 				`UPDATE outbox SET attempts = attempts + 1, last_error = $2 WHERE id = $1`, p.id, err.Error()); uerr != nil {
 				return sent, uerr
@@ -105,7 +115,7 @@ func (r *Relay) Flush(ctx context.Context, limit int) (int, error) {
 	}
 
 	var pendingCount int
-	if err := r.DB.QueryRowContext(ctx, `SELECT count(*) FROM outbox WHERE published_at IS NULL`).Scan(&pendingCount); err == nil {
+	if err := r.DB.QueryRowContext(ctx, `SELECT count(*) FROM outbox WHERE published_at IS NULL AND attempts < $1`, MaxAttempts).Scan(&pendingCount); err == nil {
 		metrics.OutboxPending.Set(float64(pendingCount))
 	}
 	return sent, publishErr

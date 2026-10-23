@@ -199,3 +199,29 @@ func TestPurgeRemovesOnlyOldPublishedRows(t *testing.T) {
 		t.Errorf("rows left = %d, want 2 (fresh published and pending)", left)
 	}
 }
+
+// One event the broker will never accept must not hold up everything behind it.
+func TestAnEventThatKeepsFailingIsParkedSoTheRestStillGoOut(t *testing.T) {
+	db := testdb.New(t)
+	rec := newRecorder()
+	rec.fail = func(e bus.Event) error {
+		if e.ID == "poison" {
+			return errors.New("payload too large")
+		}
+		return nil
+	}
+	relay := &outbox.Relay{DB: db, Pub: rec}
+	add(t, db, "poison")
+	add(t, db, "healthy")
+
+	for i := 0; i < outbox.MaxAttempts; i++ {
+		relay.Flush(context.Background(), 10)
+	}
+	if rec.count("healthy") != 0 {
+		t.Fatalf("setup: the healthy event went out early")
+	}
+	n, err := relay.Flush(context.Background(), 10)
+	if err != nil || n != 1 || rec.count("healthy") != 1 {
+		t.Fatalf("flush after parking = %d, %v, healthy published %d; want the healthy event out", n, err, rec.count("healthy"))
+	}
+}
