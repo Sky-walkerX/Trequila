@@ -85,3 +85,50 @@ func TestBaselineAdoptsADatabaseThatAlreadyHasTheLegacySchema(t *testing.T) {
 		t.Errorf("legacy columns still present: %d", cols)
 	}
 }
+
+func TestGroundedPipelineTablesEnforceTheirKeysAndCascade(t *testing.T) {
+	db := testdb.Empty(t)
+	ctx := context.Background()
+	if err := migrations.Up(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	mustExec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	mustFail := func(why, q string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, q, args...); err == nil {
+			t.Errorf("%s was accepted", why)
+		}
+	}
+	mustExec(`INSERT INTO users (id, email) VALUES ('u1', 'a@example.com')`)
+	mustExec(`INSERT INTO trips (request_id, user_id, source, destination, start_date, end_date)
+		VALUES ('t1', 'u1', 'A', 'B', '2026-12-01', '2026-12-03')`)
+	mustExec(`INSERT INTO places (osm_ref, name, kind, category, lat, lon) VALUES ('node/1', 'Tower', 'sight', 'attraction', 1, 2)`)
+	mustExec(`INSERT INTO trip_candidates (trip_id, osm_ref, rank, score) VALUES ('t1', 'node/1', 1, 3.5)`)
+	mustExec(`INSERT INTO itinerary_versions (trip_id, version, cause, content) VALUES ('t1', 1, 'generated', '{}')`)
+	mustExec(`INSERT INTO itinerary_routes (trip_id, version, content) VALUES ('t1', 1, '{}')`)
+
+	mustFail("a duplicate candidate", `INSERT INTO trip_candidates (trip_id, osm_ref, rank, score) VALUES ('t1', 'node/1', 2, 1)`)
+	mustFail("a candidate for an unknown place", `INSERT INTO trip_candidates (trip_id, osm_ref, rank, score) VALUES ('t1', 'node/9', 1, 1)`)
+	mustFail("a place with a bad kind", `INSERT INTO places (osm_ref, name, kind, category, lat, lon) VALUES ('node/2', 'X', 'hotel', 'h', 1, 2)`)
+	mustFail("version 0", `INSERT INTO itinerary_versions (trip_id, version, cause, content) VALUES ('t1', 0, 'generated', '{}')`)
+	mustFail("a route for a missing version", `INSERT INTO itinerary_routes (trip_id, version, content) VALUES ('t1', 2, '{}')`)
+	mustFail("weather with an unknown source", `INSERT INTO trip_weather (trip_id, day, code, source) VALUES ('t1', '2026-12-01', 1, 'guess')`)
+
+	mustExec(`DELETE FROM trips WHERE request_id = 't1'`)
+	for _, table := range []string{"trip_candidates", "itinerary_versions", "itinerary_routes"} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil || n != 0 {
+			t.Errorf("%s keeps %d rows after the trip is deleted (%v)", table, n, err)
+		}
+	}
+	var places int
+	db.QueryRow(`SELECT count(*) FROM places`).Scan(&places)
+	if places != 1 {
+		t.Errorf("places is a shared cache and must survive a trip deletion, has %d rows", places)
+	}
+}
