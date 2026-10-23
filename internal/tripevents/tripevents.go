@@ -73,3 +73,24 @@ func After(ctx context.Context, q Querier, tripID string, afterID int64) ([]Even
 	}
 	return out, rows.Err()
 }
+
+// TypesUpTo returns the event types the trip logged with an ID at or below upToID. A
+// resuming stream uses it to learn which stages the client has already seen.
+func TypesUpTo(ctx context.Context, q Querier, tripID string, upToID int64) (map[string]bool, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT DISTINCT type FROM trip_events WHERE trip_id = $1 AND id <= $2`, tripID, upToID)
+	if err != nil {
+		return nil, fmt.Errorf("tripevents: types: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		out[t] = true
+	}
+	return out, rows.Err()
+}

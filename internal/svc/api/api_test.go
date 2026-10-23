@@ -286,13 +286,17 @@ func TestLastEventIDResumesWithoutRepeats(t *testing.T) {
 	h.deliverItinerary(id)
 	first, _ := h.stream(id, 5*time.Second, nil)
 	placesID := first[1].ID
+	h.svc.streamPlacesGrace = 3 * time.Second // a resume that forgot places would wait this long
 
 	again, _ := h.stream(id, 5*time.Second, http.Header{"Last-Event-ID": {strconv.FormatInt(placesID, 10)}})
 
-	if names(again) != "connected,itinerary,complete" && names(again) != "connected,itinerary" {
-		// Without places replayed the stream cannot know they arrived, so it waits out
-		// the grace period and then completes; either ending is a valid resume.
-		t.Fatalf("resumed events = %s", names(again))
+	// The client saw places before it dropped; the server must remember that, or it would
+	// wait out the grace period for places that already arrived.
+	if names(again) != "connected,itinerary,complete" {
+		t.Fatalf("resumed events = %s, want connected,itinerary,complete", names(again))
+	}
+	if last := again[len(again)-1]; last.After > time.Second {
+		t.Errorf("complete took %v; a resume must not wait for the places grace period", last.After)
 	}
 	for _, e := range again {
 		if e.Name == "places" {

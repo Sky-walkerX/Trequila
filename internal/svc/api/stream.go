@@ -102,6 +102,18 @@ func (s *Service) streamTrip(w http.ResponseWriter, r *http.Request, tripID stri
 
 	last := lastEventID(r)
 	var progress streamProgress
+	if last > 0 {
+		// Stages the client saw before it dropped still count towards completion.
+		seen, err := tripevents.TypesUpTo(ctx, s.db, tripID, last)
+		if err != nil {
+			s.log.Error("stream resume query failed", "trip_id", tripID, "error", err)
+			return
+		}
+		progress = streamProgress{Itinerary: seen[streamItinerary], Places: seen[streamPlaces]}
+		if seen[streamFailed] {
+			return
+		}
+	}
 	var grace <-chan time.Time
 	hard := time.NewTimer(s.streamHardTimeout)
 	defer hard.Stop()
