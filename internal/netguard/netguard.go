@@ -47,6 +47,7 @@ var extraBlocked = mustPrefixes(
 	"192.88.99.0/24", // deprecated 6to4 relay anycast
 	"198.18.0.0/15",  // benchmarking
 	"240.0.0.0/4",    // reserved
+	"::/96",          // IPv4-compatible addresses (deprecated): ::7f00:1 is 127.0.0.1
 	"64:ff9b::/96",   // NAT64
 	"64:ff9b:1::/48", // local-use NAT64
 	"2002::/16",      // 6to4

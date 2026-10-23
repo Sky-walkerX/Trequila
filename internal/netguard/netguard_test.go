@@ -21,6 +21,7 @@ func TestBlockedAddresses(t *testing.T) {
 		"64:ff9b::7f00:1", "64:ff9b::a00:1", "64:ff9b:1::1", // NAT64
 		"2002:7f00:1::1", "2002:a9fe:a9fe::1", // 6to4
 		"2001:0:4136:e378:8000:63bf:3fff:fdd2", // Teredo
+		"::7f00:1", "::a00:1", "::a9fe:a9fe",   // IPv4-compatible (deprecated) addresses
 		"100::1", "fec0::1", "192.88.99.1", "2001:db8::1",
 	}
 	for _, s := range blockedAddrs {
